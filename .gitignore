@@ -1,5 +1,37 @@
-venv/
+# -------------------------
+# Python
+# -------------------------
 __pycache__/
-.env
-outputs/
 *.pyc
+*.pyo
+*.pyd
+
+# -------------------------
+# Virtual Environment
+# -------------------------
+venv/
+.env/
+
+# -------------------------
+# Environment Variables
+# -------------------------
+.env
+
+# -------------------------
+# Outputs (Generated Files)
+# -------------------------
+outputs/
+*.pdf
+*.md
+
+# -------------------------
+# OS / Editor
+# -------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+
+# -------------------------
+# Project Files (Private)
+# -------------------------
+Project Brief Multi Agent Textbook Updater.pdf

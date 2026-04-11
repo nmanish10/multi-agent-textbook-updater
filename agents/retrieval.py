@@ -1,91 +1,166 @@
 import requests
-import time
+import re
+from bs4 import BeautifulSoup
 
 
 # -------------------------
-# SEMANTIC SCHOLAR SEARCH
+# OPENALEX SEARCH (MAIN)
 # -------------------------
-def search_semantic_scholar(query):
-    url = "https://api.semanticscholar.org/graph/v1/paper/search"
+def search_openalex(query):
+    url = "https://api.openalex.org/works"
 
     params = {
-        "query": query,
-        "limit": 3,
-        "fields": "title,year,authors,url,abstract"
+        "search": query,
+        "per-page": 3
     }
 
     try:
-        # 🔥 small delay to reduce rate limiting
-        time.sleep(1)
-
         response = requests.get(url, params=params, timeout=10)
 
-        print("🔍 Academic Query:", query)
-        print("Status:", response.status_code)
-
-        # ❗ If rate limited, just skip (no retry, no fallback)
-        if response.status_code == 429:
-            print("⏳ Rate limited. Skipping academic results.")
-            return []
-
         if response.status_code != 200:
-            print("❌ API failed")
+            print("❌ OpenAlex failed")
             return []
 
         data = response.json()
-
-        if not data.get("data"):
-            print("⚠️ No academic results found")
-            return []
-
         results = []
 
-        for paper in data.get("data", []):
-            summary = paper.get("abstract")
+        for item in data.get("results", []):
+            # Convert abstract if exists
+            abstract = item.get("abstract_inverted_index")
 
-            if not summary:
-                summary = "No abstract available"
+            summary = "No abstract available"
+            if abstract:
+                try:
+                    words = []
+                    for word, positions in abstract.items():
+                        for pos in positions:
+                            words.append((pos, word))
+                    words = sorted(words)
+                    summary = " ".join([w[1] for w in words])
+                except:
+                    summary = str(abstract)
 
             results.append({
-                "title": paper.get("title"),
+                "title": item.get("title"),
                 "summary": summary,
-                "source": "Semantic Scholar",
+                "source": "OpenAlex",
                 "source_type": "paper",
-                "date": paper.get("year"),
-                "url": paper.get("url")
+                "date": item.get("publication_year"),
+                "url": item.get("id")
             })
 
+        print("✅ OpenAlex results:", len(results))
         return results
 
     except Exception as e:
-        print("⚠️ Error in Semantic Scholar:", str(e))
+        print("⚠️ OpenAlex error:", str(e))
         return []
 
 
 # -------------------------
-# WEB SEARCH
+# ARXIV SEARCH (LATEST)
+# -------------------------
+def search_arxiv(query):
+    url = f"http://export.arxiv.org/api/query?search_query=all:{query}&start=0&max_results=3"
+
+    try:
+        response = requests.get(url, timeout=10)
+
+        if response.status_code != 200:
+            print("❌ arXiv failed")
+            return []
+
+        entries = response.text.split("<entry>")[1:]
+        results = []
+
+        for entry in entries:
+            title = re.search(r"<title>(.*?)</title>", entry, re.DOTALL)
+            summary = re.search(r"<summary>(.*?)</summary>", entry, re.DOTALL)
+            link = re.search(r"<id>(.*?)</id>", entry)
+            date = re.search(r"<published>(.*?)</published>", entry)
+
+            results.append({
+                "title": title.group(1).strip() if title else "",
+                "summary": summary.group(1).strip() if summary else "",
+                "source": "arXiv",
+                "source_type": "preprint",
+                "date": date.group(1)[:10] if date else "",
+                "url": link.group(1) if link else ""
+            })
+
+        print("✅ arXiv results:", len(results))
+        return results
+
+    except Exception as e:
+        print("⚠️ arXiv error:", str(e))
+        return []
+
+
+# -------------------------
+# WEB SEARCH (DUCKDUCKGO)
 # -------------------------
 def search_web(query):
-    return [
-        {
-            "title": f"Web result for {query}",
-            "summary": f"Summary about {query}",
-            "source": "Web",
-            "source_type": "web",
-            "date": "2024",
-            "url": f"https://www.google.com/search?q={query.replace(' ', '+')}"
-        }
-    ]
+    url = "https://html.duckduckgo.com/html/"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
+
+    data = {
+        "q": query
+    }
+
+    try:
+        response = requests.post(url, headers=headers, data=data, timeout=10)
+
+        if response.status_code != 200:
+            print("❌ Web search failed:", response.status_code)
+            return []
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        results = []
+
+        for result in soup.select(".result")[:3]:
+            title_tag = result.select_one(".result__title")
+            snippet_tag = result.select_one(".result__snippet")
+            link_tag = result.select_one("a.result__a")
+
+            title = title_tag.get_text(strip=True) if title_tag else ""
+            summary = snippet_tag.get_text(strip=True) if snippet_tag else ""
+            link = link_tag["href"] if link_tag else ""
+
+            results.append({
+                "title": title,
+                "summary": summary,
+                "source": "Web",
+                "source_type": "web",
+                "date": "",
+                "url": link
+            })
+
+        print("✅ Web results:", len(results))
+        return results
+
+    except Exception as e:
+        print("⚠️ Web search error:", str(e))
+        return []
 
 
 # -------------------------
 # COMBINED RETRIEVAL
 # -------------------------
 def retrieve_all(query):
-    # ✅ Try academic once (no fallback)
-    academic = search_semantic_scholar(query)
+    print("\n🔍 Searching:", query)
 
-    # ✅ Always include web results
-    web = search_web(query)
+    results = []
 
-    return academic + web
+    # Academic sources
+    results += search_openalex(query)
+    results += search_arxiv(query)
+
+    # Web fallback
+    results += search_web(query)
+
+    return results

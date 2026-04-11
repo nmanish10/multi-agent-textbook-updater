@@ -1,34 +1,99 @@
 # 📘 Multi-Agent Textbook Update System
 
 ## 🚀 Overview
-This project implements a **multi-agent pipeline** that reads textbook chapters, analyzes them, and retrieves relevant recent developments from academic and web sources.
+This project implements a **multi-agent pipeline** that reads textbook chapters, analyzes them, retrieves recent research developments, and **appends meaningful updates to the end of each chapter**.
 
-The goal is to simulate a system that can **augment textbooks with updated knowledge**.
+The system is designed to:
+- Understand chapters holistically
+- Identify relevant modern developments
+- Filter and rank high-quality updates
+- Generate textbook-style addenda
 
 ---
 
-## 🧠 Features Implemented (Week 1 + Week 2)
+## 🧠 Current System Capabilities (MVP Complete)
 
 ### ✅ 1. Document Ingestion
-- Parses PDF and Markdown textbooks
+- Supports:
+  - PDF (via pdfplumber)
+  - Markdown (.md)
 - Extracts:
   - Chapters
   - Sections
-  - Content structure
+  - Structured content hierarchy
+
+---
 
 ### ✅ 2. Chapter Understanding Agent
 - Generates:
   - Chapter summary
   - Key concepts
-  - Search queries
+  - Research-oriented search queries
 
-### ✅ 3. Retrieval Pipeline
-- Academic search (Semantic Scholar API)
-- Web search (simulated)
-- Returns structured JSON results
+---
 
-### ✅ 4. Structured Output
-- Saves results in `outputs/results.json`
+### ✅ 3. Retrieval Pipeline (UPDATED)
+- Academic sources:
+  - OpenAlex API
+  - arXiv API
+- Web fallback:
+  - DuckDuckGo scraping
+- Handles:
+  - API failures
+  - Timeouts
+  - Deduplication (basic)
+
+---
+
+### ✅ 4. Evidence Extraction Agent
+- Converts raw results into structured updates
+- Extracts:
+  - What changed
+  - Why it matters
+  - Supporting evidence
+
+---
+
+### ✅ 5. Relevance & Quality Judge Agent
+- Scores each candidate on:
+  - Relevance
+  - Significance
+  - Credibility
+  - Novelty
+  - Pedagogical fit
+- Applies strict filtering thresholds
+
+---
+
+### ✅ 6. Ranking Agent
+- Selects **top 3 updates per chapter**
+- Removes weaker or redundant updates
+
+---
+
+### ✅ 7. Section Mapping Agent
+- Maps updates to most relevant section
+- Enables:
+  - Structured numbering (e.g., 1.3.1, 1.3.2)
+
+---
+
+### ✅ 8. Update Writer Agent
+- Generates **textbook-style content**
+- Produces:
+  - Subsection title
+  - 2-paragraph academic explanation
+  - References
+
+---
+
+### ✅ 9. Renderer / Export
+- Outputs:
+  - Updated Markdown textbook
+  - Generated PDF version
+- Updates are:
+  - Appended at end of chapter
+  - Properly numbered and structured
 
 ---
 
@@ -41,12 +106,19 @@ multi_agent_textbook_updater/
 ├── agents/
 │   ├── chapter_analysis.py
 │   ├── retrieval.py
+│   ├── evidence_extractor.py
+│   ├── judge.py
+│   ├── ranker.py
+│   ├── section_mapper.py
+│   ├── writer.py
 │
 ├── utils/
 │   ├── pdf_parser.py
 │   ├── md_parser.py
 │   ├── llm.py
 │   ├── storage.py
+│   ├── textbook_updater.py
+│   ├── pdf_generator.py
 │
 ├── schemas/
 │   ├── schemas.py
@@ -56,6 +128,9 @@ multi_agent_textbook_updater/
 │   ├── sample.md
 │
 ├── outputs/
+│   ├── results.json
+│   ├── updated_book.md
+│   ├── updated_book.pdf
 │
 ├── main.py
 ├── requirements.txt
@@ -85,7 +160,7 @@ pip install -r requirements.txt
 
 ### 3️⃣ Add API Key
 
-Create a `.env` file in the root directory:
+Create a `.env` file:
 
 ```
 MISTRAL_API_KEY=your_api_key_here
@@ -101,10 +176,10 @@ python main.py
 
 ---
 
-## 📊 Example Output
+## 📊 Output Example
 
 ```
-📘 Chapter 8 / Intrusion Detection
+📘 Chapter 1: Foundations of AI
 
 📝 Summary:
 ...
@@ -112,25 +187,38 @@ python main.py
 🧠 Concepts:
 ...
 
-🔍 Queries:
+🔍 Query:
 ...
 
+📊 Candidate Scores:
+...
+
+🏆 Top Updates:
+...
+
+📘 Final Textbook Updates:
+...
 ```
 
-Results are saved in:
+---
 
-```
-outputs/results.json
-```
+## 📄 Generated Outputs
+
+* `outputs/results.json` → structured pipeline data
+* `outputs/updated_book.md` → updated textbook
+* `outputs/updated_book.pdf` → rendered PDF
 
 ---
 
 ## ⚠️ Notes
 
-* Academic API may return **429 (rate limit)** → system will still continue using web results
-* Queries are limited to avoid API overload
-* Currently operates at **chapter level**
-* Section-level mapping and scoring are planned for next phases
+* Max **3 updates per chapter**
+* Strict filtering ensures:
+
+  * no weak updates
+  * no noise
+* System may return **0 updates** if nothing strong is found
+* LLM fallback ensures robustness
 
 ---
 
@@ -139,19 +227,23 @@ outputs/results.json
 * Python
 * pdfplumber (PDF parsing)
 * Mistral API (LLM)
-* Semantic Scholar API (academic search)
+* OpenAlex API (academic search)
+* arXiv API (latest research)
+* DuckDuckGo (web fallback)
+* ReportLab (PDF generation)
 
 ---
 
-## 📌 Future Work
+## 📌 Next Steps (Future Work)
 
-* Scoring and filtering updates
-* Section mapping
-* Ranking top updates
-* Markdown output generation
+* Better deduplication across sources
+* Stronger section mapping (embeddings)
+* UI for course-based textbook updates
+* Scheduled updates / version tracking
+* Domain-specific search optimization
 
 ---
 
 ## 👥 Team
 
-* Multi-Agent Textbook Update System Project
+Multi-Agent Textbook Update System Project
