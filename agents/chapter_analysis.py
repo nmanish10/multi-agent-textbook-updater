@@ -1,29 +1,58 @@
-from utils.llm import call_mistral
+from core.prompts import prompt_version
+from utils.llm import call_mistral_structured
+from schemas.schemas import ChapterAnalysisScore
 import json
 
 
-def analyze_chapter(chapter):
-    prompt = f"""
-You are analyzing a textbook chapter.
+# -------------------------
+# FALLBACK
+# -------------------------
+def fallback_output(chapter):
+    title = chapter.title
 
-Your task:
-1. Summarize the chapter (5-6 lines, academic tone)
-2. Extract 5-8 key concepts (important terms only)
-3. Generate 5 high-quality research queries
+    return {
+        "summary": f"This chapter discusses {title} and its core theoretical foundations.",
+        "key_concepts": [title],
+        "search_queries": [
+            f"recent advances in {title}",
+            f"{title} machine learning methods",
+            f"modern techniques in {title}"
+        ]
+    }
+
+
+# -------------------------
+# MAIN FUNCTION
+# -------------------------
+def analyze_chapter(chapter, max_retries=2):
+
+    content = chapter.content[:3000]
+    content = content.rsplit(" ", 1)[0]
+
+    prompt = f"""
+You are analyzing a textbook chapter for research integration.
+
+Tasks:
+1. Write a concise academic summary (5–6 lines)
+2. Extract 6–10 key concepts (technical terms only)
+3. Generate 5 HIGH-QUALITY research queries
 
 IMPORTANT:
-- Queries MUST be grounded in the chapter's key concepts
-- Focus on theoretical, methodological, or algorithmic developments
-- Avoid domain-specific applications unless central to the chapter
-- Ensure queries stay aligned with the chapter's subject
+- Queries must be diverse:
+  • theoretical advancements
+  • algorithmic improvements
+  • modern techniques
+  • limitations and improvements
+- Avoid overly narrow or overly broad queries
+- Focus on concepts central to the chapter
 
 Chapter Title:
 {chapter.title}
 
 Chapter Content:
-{chapter.content[:3000]}
+{content}
 
-Return ONLY valid JSON:
+Return JSON ONLY:
 {{
   "summary": "...",
   "key_concepts": ["...", "..."],
@@ -31,29 +60,17 @@ Return ONLY valid JSON:
 }}
 """
 
-    response = call_mistral(prompt)
-
-    # -------------------------
-    # CLEAN RESPONSE (IMPORTANT FIX)
-    # -------------------------
-    response = response.strip()
-
-    if response.startswith("```"):
-        response = response.replace("```json", "").replace("```", "").strip()
-
-    # -------------------------
-    # PARSE JSON SAFELY
-    # -------------------------
     try:
-        return json.loads(response)
-
+        parsed_result = call_mistral_structured(
+            prompt,
+            ChapterAnalysisScore,
+            system_prompt="You are an expert academic reviewer analyzing a textbook chapter.",
+            max_retries=max_retries,
+            prompt_name="chapter_analysis",
+            prompt_version=prompt_version("chapter_analysis"),
+        )
+        return parsed_result.model_dump()
+        
     except Exception as e:
-        print("⚠️ JSON parsing failed.")
-        print("Raw response:")
-        print(response)
-
-        return {
-            "summary": "",
-            "key_concepts": [],
-            "search_queries": []
-        }
+        print(f"🚨 Falling back to default chapter analysis: {str(e)}")
+        return fallback_output(chapter)

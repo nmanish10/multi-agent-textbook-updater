@@ -1,14 +1,89 @@
-from utils.llm import call_mistral
-import json
+import re
+
+from core.prompts import prompt_version
+from schemas.schemas import JudgeScore
+from utils.llm import call_mistral_structured
 
 
-def judge_candidates(chapter_analysis, candidates):
+def tokenize(text):
+    text = text.lower()
+    return set(re.findall(r"\b[a-z]{3,}\b", text))
+
+
+def compute_concept_overlap(chapter_analysis, cand):
+    concepts = chapter_analysis.get("key_concepts", [])
+    concept_tokens = set()
+    for concept in concepts:
+        concept_tokens |= tokenize(concept)
+
+    cand_text = f"{cand.get('candidate_title') or ''} {cand.get('summary') or ''}"
+    cand_tokens = tokenize(cand_text)
+    if not concept_tokens:
+        return 0
+    return len(concept_tokens & cand_tokens) / len(concept_tokens)
+
+
+def extract_source_credibility(cand):
+    if cand.get("credibility_score") is not None:
+        return float(cand["credibility_score"])
+
+    sources = cand.get("sources", [])
+    if sources:
+        score = sources[0].get("credibility_score")
+        if score is not None:
+            return float(score)
+    return 0.5
+
+
+def adjust_scores(cand, scores, chapter_analysis):
+    source_type = cand.get("source_type", "")
+    source_credibility = extract_source_credibility(cand)
+    retrieval_score = float(cand.get("retrieval_score", 0) or 0)
+    semantic_score = float(cand.get("semantic_score", 0) or 0)
+
+    if source_type == "web":
+        scores["credibility"] *= 0.88
+    elif source_type == "paper":
+        scores["credibility"] = min(scores["credibility"] * 1.08, 1.0)
+    elif source_type == "preprint":
+        scores["credibility"] *= 0.94
+
+    scores["credibility"] = min(1.0, 0.55 * scores["credibility"] + 0.45 * source_credibility)
+
+    overlap = compute_concept_overlap(chapter_analysis, cand)
+    scores["relevance"] = min(scores["relevance"] + 0.18 * overlap + 0.08 * semantic_score, 1.0)
+    scores["significance"] = min(scores["significance"] + 0.05 * retrieval_score, 1.0)
+
+    if overlap < 0.15:
+        scores["relevance"] *= 0.68
+        scores["significance"] *= 0.78
+
+    if source_credibility < 0.45:
+        scores["credibility"] *= 0.82
+        scores["final_score"] = min(scores.get("final_score", 0), 0.72)
+
+    scores["final_score"] = (
+        0.30 * scores["relevance"]
+        + 0.25 * scores["significance"]
+        + 0.20 * scores["credibility"]
+        + 0.15 * scores["novelty"]
+        + 0.10 * scores["pedagogical_fit"]
+    )
+
+    if scores["final_score"] >= 0.78 and scores["relevance"] >= 0.75 and scores["credibility"] >= 0.70:
+        scores["decision"] = "accept"
+    else:
+        scores["decision"] = "reject"
+
+    return scores
+
+
+def judge_candidates(chapter_analysis, candidates, max_retries=2):
     judged = []
 
     for cand in candidates:
-
         prompt = f"""
-You are a STRICT but practical academic reviewer deciding whether a research update should be added to a textbook chapter.
+You are a STRICT academic reviewer.
 
 Chapter Summary:
 {chapter_analysis.get("summary")}
@@ -16,57 +91,27 @@ Chapter Summary:
 Key Concepts:
 {chapter_analysis.get("key_concepts")}
 
-Candidate Update:
+Candidate:
 Title: {cand.get("candidate_title")}
 Summary: {cand.get("summary")}
 Why it matters: {cand.get("why_it_matters")}
-Source Type: {cand.get("source_type")}
+Source: {cand.get("source_type")}
 Date: {cand.get("date")}
 
------------------------------
-EVALUATION INSTRUCTIONS
------------------------------
+Score STRICTLY (0-1):
 
-Score the candidate from 0 to 1 on:
+- relevance
+- significance
+- credibility
+- novelty
+- pedagogical_fit
 
-1. relevance (to core chapter concepts ONLY)
-2. significance (importance of idea)
-3. credibility (paper > preprint > web)
-4. novelty (new vs textbook)
-5. pedagogical_fit (useful for students)
+Rules:
+- Penalize domain-specific or unrelated work
+- Reward core algorithmic or theoretical contributions
+- Prefer generalizable ideas
 
------------------------------
-STRICT GUIDELINES
------------------------------
-
-Prefer HIGH relevance to core AI concepts:
-- Algorithms
-- Problem-solving
-- Knowledge representation
-- Data-driven models
-- Computational methods
-
-Reject or score LOW if:
-- Domain-specific application (e.g., agriculture, biology, IoT)
-- Weak conceptual contribution
-- Only application, not theory
-- Indirect connection to chapter
-
------------------------------
-FINAL SCORE FORMULA
------------------------------
-
-final_score =
-0.30 * relevance +
-0.25 * significance +
-0.20 * credibility +
-0.15 * novelty +
-0.10 * pedagogical_fit
-
------------------------------
-OUTPUT FORMAT (JSON ONLY)
------------------------------
-
+Return JSON ONLY:
 {{
   "relevance": 0.0,
   "significance": 0.0,
@@ -79,48 +124,42 @@ OUTPUT FORMAT (JSON ONLY)
 }}
 """
 
-        response = call_mistral(prompt)
-
-        # -------------------------
-        # CLEAN RESPONSE
-        # -------------------------
-        response = response.strip()
-
-        if response.startswith("```"):
-            response = response.replace("```json", "").replace("```", "").strip()
-
-        # -------------------------
-        # PARSE JSON
-        # -------------------------
         try:
-            scores = json.loads(response)
-
+            parsed_result = call_mistral_structured(
+                prompt,
+                JudgeScore,
+                system_prompt="You are a STRICT academic reviewer evaluating new additions for a textbook.",
+                max_retries=max_retries,
+                prompt_name="judge_candidate",
+                prompt_version=prompt_version("judge_candidate"),
+            )
+            scores = parsed_result.model_dump()
+            scores = adjust_scores(cand, scores, chapter_analysis)
             cand["scores"] = scores
             cand["decision"] = scores.get("decision", "reject")
-
+            cand["judge_reason"] = scores.get("reason", "")
             judged.append(cand)
+        except Exception as e:
+            print(f"WARNING: Skipping candidate (judge failed): {str(e)}")
 
-        except Exception:
-            continue
-
-    # -------------------------
-    # DEBUG (VERY USEFUL)
-    # -------------------------
-    print("\n📊 Candidate Scores:")
-    for c in judged:
+    print("\nCandidate Evaluation:")
+    for cand in judged:
         print(
-            f"- {c.get('candidate_title')[:50]} | "
-            f"Score: {c['scores'].get('final_score', 0):.2f} | "
-            f"Relevance: {c['scores'].get('relevance', 0):.2f}"
+            f"- {cand.get('candidate_title')[:50]} | "
+            f"Final: {cand['scores'].get('final_score', 0):.2f} | "
+            f"Rel: {cand['scores'].get('relevance', 0):.2f} | "
+            f"Cred: {cand['scores'].get('credibility', 0):.2f}"
         )
 
-    # -------------------------
-    # BALANCED FILTER (FINAL)
-    # -------------------------
     filtered = [
-        c for c in judged
-        if c["scores"].get("final_score", 0) >= 0.70
-        and c["scores"].get("relevance", 0) >= 0.65
+        cand
+        for cand in judged
+        if cand["scores"].get("decision") == "accept"
+        and cand["scores"].get("final_score", 0) >= 0.78
+        and cand["scores"].get("relevance", 0) >= 0.75
+        and cand["scores"].get("credibility", 0) >= 0.70
+        and cand["scores"].get("significance", 0) >= 0.65
     ]
 
+    print(f"\nAccepted: {len(filtered)} / {len(judged)}\n")
     return filtered

@@ -4,3 +4,12 @@ python-dotenv
 beautifulsoup4
 reportlab
 lxml
+pydantic
+aiohttp
+sentence-transformers
+torch
+diskcache
+markdown
+xhtml2pdf
+python-docx
+Pillow

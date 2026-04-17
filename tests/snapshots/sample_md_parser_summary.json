@@ -1,0 +1,12 @@
+{
+  "book_title": "Sample",
+  "chapters": 1,
+  "sections": 18,
+  "chapter_titles": [
+    "Advanced Computer Networks"
+  ],
+  "warnings": [
+    "Book title inferred from file name",
+    "Mixed section numbering prefixes in chapter 1: 1, 2, 3"
+  ]
+}

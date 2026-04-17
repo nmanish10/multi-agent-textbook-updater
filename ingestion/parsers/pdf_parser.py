@@ -1,0 +1,384 @@
+from __future__ import annotations
+
+import os
+import re
+import tempfile
+from pathlib import Path
+from typing import Callable, Dict, List, Tuple
+
+from core.console import ensure_utf8_console
+from core.models import Block, Book, ParseMetadata, ParseReport
+from ingestion.parsers.assets import write_binary_asset
+from pypdf import PdfReader
+from utils.md_parser import parse_markdown as legacy_parse_markdown
+from utils.pdf_to_md import convert_pdf_to_md
+
+
+def _clean_line(text: str) -> str:
+    text = text.replace("\r", "")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _is_valid_chapter(line: str) -> bool:
+    if len(line.split()) < 3 or len(line) > 120:
+        return False
+    if any(x in line for x in ["=", "Σ", "λ", "|", "∈"]):
+        return False
+    if re.search(r"\d+\.\d+", line):
+        return False
+    return True
+
+
+def _extract_sections(line: str) -> List[str]:
+    pattern = r"(\d+\.\d+\s+[A-Za-z][^0-9]{0,80})"
+    return re.findall(pattern, line)
+
+
+def _is_all_caps_heading(line: str) -> bool:
+    return len(line.split()) <= 8 and line.isupper() and len(line) > 5
+
+
+def _merge_lines(lines: List[str]) -> List[str]:
+    merged: List[str] = []
+    buffer = ""
+    for line in lines:
+        if not buffer:
+            buffer = line
+            continue
+        if buffer.endswith("-"):
+            buffer = buffer[:-1] + line
+            continue
+        if (
+            buffer.endswith(".")
+            or buffer.endswith(":")
+            or buffer.endswith("?")
+            or buffer.endswith("!")
+            or line.startswith("Chapter")
+            or re.match(r"\d+\.\d+", line)
+        ):
+            merged.append(buffer)
+            buffer = line
+        else:
+            buffer += " " + line
+    if buffer:
+        merged.append(buffer)
+    return merged
+
+
+def _deduplicate(lines: List[str]) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for line in lines:
+        key = re.sub(r"\W+", "", line.lower())
+        if len(key) < 20:
+            result.append(line)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(line)
+    return result
+
+
+def _extract_chapter(line: str) -> str | None:
+    match = re.match(r"chapter\s+\d+[:\s].*", line, re.IGNORECASE)
+    if match and _is_valid_chapter(line):
+        return line.strip()
+    return None
+
+
+def _convert_pdf_to_md_pypdf(pdf_path: str, output_path: str) -> str:
+    reader = PdfReader(pdf_path)
+    raw_lines: List[str] = []
+
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        for line in text.split("\n"):
+            cleaned = _clean_line(line)
+            if cleaned:
+                raw_lines.append(cleaned)
+
+    md_lines: List[str] = []
+    seen_chapters = set()
+    found_chapter = False
+
+    for line in raw_lines:
+        chapter = _extract_chapter(line)
+        if chapter and chapter not in seen_chapters:
+            seen_chapters.add(chapter)
+            found_chapter = True
+            md_lines.append(f"\n# {chapter}\n")
+            continue
+
+        if _is_all_caps_heading(line):
+            md_lines.append(f"\n## {line.title()}\n")
+            continue
+
+        sections = _extract_sections(line)
+        if sections:
+            for section in sections:
+                md_lines.append(f"\n## {section.strip()}\n")
+                line = line.replace(section, "").strip()
+
+        if line:
+            md_lines.append(line)
+
+    md_lines = _merge_lines(md_lines)
+    if not found_chapter:
+        fallback_lines = []
+        for line in md_lines:
+            if re.match(r"^\d+\s+[A-Za-z]", line):
+                fallback_lines.append(f"\n# {line}\n")
+            else:
+                fallback_lines.append(line)
+        md_lines = fallback_lines
+
+    md_lines = _deduplicate(md_lines)
+    Path(output_path).write_text("\n".join(md_lines), encoding="utf-8")
+    return output_path
+
+
+def _score_book(book: Book) -> Tuple[float, List[str]]:
+    warnings: List[str] = []
+    chapters = len(book.chapters)
+    sections = sum(len(chapter.sections) for chapter in book.chapters)
+    total_words = sum(len(chapter.content.split()) for chapter in book.chapters)
+    weak_chapters = [chapter.chapter_id for chapter in book.chapters if len(chapter.content.split()) < 120]
+
+    if chapters == 0:
+        warnings.append("No chapters parsed")
+    if sections == 0:
+        warnings.append("No sections parsed")
+    if weak_chapters:
+        warnings.append(f"Weak chapters detected: {', '.join(weak_chapters)}")
+
+    score = (
+        chapters * 8.0
+        + sections * 2.0
+        + min(total_words / 250.0, 20.0)
+        - len(weak_chapters) * 2.5
+    )
+    return score, warnings
+
+
+def _attach_metadata(
+    parsed: Book,
+    file_path: str,
+    parser_name: str,
+    confidence: float,
+    candidate_scores: List[dict],
+    warnings: List[str],
+    scanned_pages: int = 0,
+    ocr_recommended: bool = False,
+) -> Book:
+    sections_detected = 0
+    assets_detected = 0
+    low_confidence_chapters = []
+
+    for chapter in parsed.chapters:
+        chapter_confidence = confidence if chapter.sections else max(0.55, confidence - 0.2)
+        if chapter_confidence < 0.8:
+            low_confidence_chapters.append(chapter.chapter_id)
+        chapter.metadata = ParseMetadata(
+            source_path=file_path,
+            source_format="pdf",
+            parser_name=parser_name,
+            confidence=chapter_confidence,
+        )
+        for section in chapter.sections:
+            existing_blocks = [block for block in section.blocks if block.block_type == "image"]
+            section.blocks = existing_blocks + [Block(text=section.content)]
+            section.metadata = ParseMetadata(
+                source_path=file_path,
+                source_format="pdf",
+                parser_name=parser_name,
+                confidence=max(0.6, chapter_confidence - 0.05),
+            )
+            sections_detected += 1
+            assets_detected += len(existing_blocks)
+
+    parsed.metadata = ParseMetadata(
+        source_path=file_path,
+        source_format="pdf",
+        parser_name=parser_name,
+        confidence=confidence,
+    )
+    parsed.parse_report = ParseReport(
+        parser_name=parser_name,
+        strategy_used=parser_name,
+        chapters_detected=len(parsed.chapters),
+        sections_detected=sections_detected,
+        assets_detected=assets_detected,
+        warnings=warnings,
+        scanned_pages=scanned_pages,
+        ocr_recommended=ocr_recommended,
+        low_confidence_chapters=low_confidence_chapters,
+        candidate_scores=candidate_scores,
+    )
+    return parsed
+
+
+def _extract_pdf_images(file_path: str, parsed: Book) -> List[str]:
+    reader = PdfReader(file_path)
+    extracted = []
+    chapters = parsed.chapters
+    if not chapters:
+        return extracted
+
+    current_chapter_index = 0
+    chapter_titles = [chapter.title.lower() for chapter in chapters]
+
+    for page_index, page in enumerate(reader.pages):
+        page_text = (page.extract_text() or "").lower()
+        for idx, title in enumerate(chapter_titles):
+            if title and title in page_text:
+                current_chapter_index = idx
+
+        try:
+            images = list(page.images)
+        except Exception:
+            images = []
+
+        for image_idx, image in enumerate(images, start=1):
+            try:
+                extension = Path(image.name).suffix or ".png"
+                asset_path = write_binary_asset(
+                    file_path,
+                    f"pdf_page_{page_index + 1}_image_{image_idx}{extension}",
+                    image.data,
+                )
+                chapter = chapters[min(current_chapter_index, len(chapters) - 1)]
+                target_section = chapter.sections[0] if chapter.sections else None
+                if target_section:
+                    target_section.blocks.append(
+                        Block(
+                            block_type="image",
+                            asset_type="image",
+                            asset_path=asset_path,
+                            mime_type="image",
+                            alt_text=f"Extracted figure from page {page_index + 1}",
+                            text=f"Extracted figure from page {page_index + 1}",
+                            page_start=page_index + 1,
+                            page_end=page_index + 1,
+                            confidence=0.65,
+                        )
+                    )
+                    target_section.content += f"\n![Extracted figure from page {page_index + 1}]({asset_path})"
+                extracted.append(asset_path)
+            except Exception:
+                continue
+    return extracted
+
+
+def _analyze_pdf_pages(file_path: str) -> tuple[int, bool, list[str]]:
+    reader = PdfReader(file_path)
+    scanned_pages = 0
+    warnings: list[str] = []
+    total_pages = len(reader.pages)
+
+    for page_index, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        text_chars = len(re.sub(r"\s+", "", text))
+        try:
+            image_count = len(list(page.images))
+        except Exception:
+            image_count = 0
+        if text_chars < 40 and image_count > 0:
+            scanned_pages += 1
+        elif text_chars < 20:
+            scanned_pages += 1
+        if image_count >= 3 and text_chars < 120:
+            warnings.append(f"Page {page_index} appears image-heavy and may need OCR or manual review")
+
+    ocr_recommended = total_pages > 0 and scanned_pages >= max(1, total_pages // 3)
+    if ocr_recommended:
+        warnings.append(
+            f"Detected {scanned_pages} low-text PDF pages out of {total_pages}; OCR fallback is recommended for best results"
+        )
+    return scanned_pages, ocr_recommended, warnings
+
+
+def _run_strategy(
+    strategy_name: str,
+    converter: Callable[[str, str], str],
+    file_path: str,
+) -> Tuple[Book, Dict]:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{strategy_name}.md") as temp_file:
+        temp_path = temp_file.name
+
+    try:
+        markdown_path = converter(file_path, temp_path)
+        parsed = legacy_parse_markdown(markdown_path)
+        score, warnings = _score_book(parsed)
+        details = {
+            "strategy": strategy_name,
+            "score": round(score, 2),
+            "chapters": len(parsed.chapters),
+            "sections": sum(len(chapter.sections) for chapter in parsed.chapters),
+            "warnings": warnings,
+        }
+        return parsed, details
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def parse_pdf_document(file_path: str) -> Book:
+    ensure_utf8_console()
+
+    strategies: List[Tuple[str, Callable[[str, str], str]]] = [
+        ("pdfplumber_bridge", convert_pdf_to_md),
+        ("pypdf_bridge", _convert_pdf_to_md_pypdf),
+    ]
+
+    candidates: List[Tuple[Book, Dict]] = []
+    candidate_scores: List[dict] = []
+
+    for strategy_name, converter in strategies:
+        try:
+            parsed, details = _run_strategy(strategy_name, converter, file_path)
+            candidates.append((parsed, details))
+            candidate_scores.append(details)
+        except Exception as exc:
+            candidate_scores.append(
+                {
+                    "strategy": strategy_name,
+                    "score": -1,
+                    "chapters": 0,
+                    "sections": 0,
+                    "warnings": [f"Strategy failed: {exc}"],
+                }
+            )
+
+    if not candidates:
+        raise ValueError("All PDF parsing strategies failed")
+
+    best_book, best_details = max(candidates, key=lambda item: item[1]["score"])
+    warnings = list(best_details.get("warnings", []))
+    warnings.extend(
+        [
+            f"Alternative strategy {score['strategy']} scored {score['score']}"
+            for score in candidate_scores
+            if score["strategy"] != best_details["strategy"] and score["score"] >= 0
+        ]
+    )
+
+    confidence = 0.9 if best_details["score"] >= 20 else 0.82 if best_details["score"] >= 12 else 0.72
+    scanned_pages, ocr_recommended, page_warnings = _analyze_pdf_pages(file_path)
+    warnings.extend(page_warnings)
+    parsed = _attach_metadata(
+        best_book,
+        file_path,
+        best_details["strategy"],
+        confidence,
+        candidate_scores,
+        warnings,
+        scanned_pages=scanned_pages,
+        ocr_recommended=ocr_recommended,
+    )
+    extracted_images = _extract_pdf_images(file_path, parsed)
+    if parsed.parse_report and extracted_images:
+        parsed.parse_report.warnings.append(f"Extracted {len(extracted_images)} PDF images")
+        parsed.parse_report.assets_detected += len(extracted_images)
+    return parsed
