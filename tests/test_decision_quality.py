@@ -4,7 +4,7 @@ import unittest
 
 from agents.evidence_extractor import source_signal_score
 from agents.judge import adjust_scores
-from agents.retrieval import canonicalize_url, infer_credibility, normalize_result
+from agents.retrieval import canonicalize_url, compute_credibility, infer_credibility, normalize_result
 from agents.section_mapper import score_sections, top_section_confident
 
 
@@ -16,6 +16,7 @@ class DecisionQualityTests(unittest.TestCase):
     def test_trusted_domain_gets_high_web_credibility(self) -> None:
         self.assertGreaterEqual(infer_credibility("web", "https://www.nist.gov/ai"), 0.95)
         self.assertLessEqual(infer_credibility("web", "https://medium.com/some-post"), 0.3)
+        self.assertGreaterEqual(infer_credibility("official_source", "https://openai.com/index/hello"), 0.95)
 
     def test_normalize_result_adds_credibility_and_domain(self) -> None:
         result = normalize_result(
@@ -31,9 +32,35 @@ class DecisionQualityTests(unittest.TestCase):
         self.assertGreaterEqual(result["credibility_score"], 0.95)
 
     def test_source_signal_score_prefers_strong_retrieval_and_credibility(self) -> None:
-        strong = {"retrieval_score": 0.9, "credibility_score": 0.95}
-        weak = {"retrieval_score": 0.8, "credibility_score": 0.3}
+        strong = {"retrieval_score": 0.9, "credibility_score": 0.95, "recency_score": 0.85, "venue_score": 0.9}
+        weak = {"retrieval_score": 0.8, "credibility_score": 0.3, "recency_score": 0.4, "venue_score": 0.5}
         self.assertGreater(source_signal_score(strong), source_signal_score(weak))
+
+    def test_multi_signal_credibility_rewards_recent_strong_venue(self) -> None:
+        recent = compute_credibility(
+            {
+                "source_type": "paper",
+                "url": "https://example.com/paper",
+                "date": "2026-03-01",
+                "venue": "NeurIPS 2026",
+                "cited_by_count": 18,
+                "author_works_count": 120,
+                "author_cited_by_count": 2400,
+            }
+        )
+        weak = compute_credibility(
+            {
+                "source_type": "web",
+                "url": "https://medium.com/post",
+                "date": "2024-01-01",
+                "venue": "",
+                "cited_by_count": 0,
+                "author_works_count": 0,
+                "author_cited_by_count": 0,
+            }
+        )
+        self.assertGreater(recent["credibility_score"], weak["credibility_score"])
+        self.assertGreaterEqual(recent["venue_score"], 0.9)
 
     def test_adjust_scores_uses_source_credibility(self) -> None:
         candidate = {
@@ -67,6 +94,8 @@ class DecisionQualityTests(unittest.TestCase):
         ]
         scored = score_sections("wavelet transforms for spectral analysis", sections)
         self.assertEqual(scored[0][0], "1.2")
+        self.assertGreater(scored[0][1]["final_score"], scored[1][1]["final_score"])
+        self.assertGreater(scored[0][1]["token_overlap"], 0)
         self.assertTrue(top_section_confident(scored))
 
 

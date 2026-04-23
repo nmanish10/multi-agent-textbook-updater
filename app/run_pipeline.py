@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import logging
 import time
 from typing import Dict, List
 
 from agents.chapter_analysis import analyze_chapter
 from agents.evidence_extractor import extract_evidence
 from agents.judge import judge_candidates
-from agents.ranker import rank_and_select
+from agents.ranker import competitive_replacement, rank_and_select
 from agents.retrieval import retrieve_all
 from agents.section_mapper import map_to_sections
 from agents.writer import write_updates
 from core.config import PipelineSettings
 from core.console import ensure_utf8_console
+from core.logging import configure_logging, get_logger, log_event
 from core.models import (
     AcceptedUpdate,
     Book,
@@ -31,8 +33,11 @@ from rendering.pdf_exporter import export_pdf
 from review.review_pack import write_review_pack
 from research.query_planner import build_query_plan
 from storage.artifact_store import ArtifactStore
+from storage.update_store import PersistentUpdateStore
 from utils.llm import get_prompt_traces, reset_prompt_traces
 from utils.storage import save_results
+
+logger = get_logger("textbook_updater.pipeline")
 
 
 def dedupe_retrieval_results(results: List[Dict]) -> List[Dict]:
@@ -73,8 +78,32 @@ def _save_book_artifacts(store: ArtifactStore, book: Book) -> None:
         store.write_json("book/parse_report.json", book.parse_report.model_dump(mode="json"))
 
 
+def _written_update_to_rankable(update: WrittenUpdate) -> Dict:
+    primary_source = update.sources[0].model_dump(mode="json") if update.sources else {}
+    return {
+        "candidate_title": update.title,
+        "summary": update.text,
+        "why_it_matters": update.why_it_matters,
+        "source_title": primary_source.get("title", ""),
+        "source_type": primary_source.get("source_type", ""),
+        "source_name": primary_source.get("source_name", ""),
+        "date": primary_source.get("date", ""),
+        "url": primary_source.get("url", "") or update.source,
+        "sources": [source.model_dump(mode="json") for source in update.sources],
+        "retrieval_score": update.scores.get("final_score", 0),
+        "credibility_score": primary_source.get("credibility_score", 0),
+        "mapped_section_id": update.section_id,
+        "mapping_score": update.scores.get("final_score", 0),
+        "mapping_reason": update.mapping_rationale,
+        "scores": update.scores,
+        "decision": update.scores.get("decision", "accept"),
+        "text": update.text,
+    }
+
+
 def run_pipeline(settings: PipelineSettings | None = None) -> Dict:
     ensure_utf8_console()
+    configure_logging()
     settings = settings or PipelineSettings.from_env()
     settings.ensure_directories()
     reset_prompt_traces()
@@ -84,10 +113,18 @@ def run_pipeline(settings: PipelineSettings | None = None) -> Dict:
     stats: RunStats = create_run_stats()
     store = ArtifactStore(settings.artifact_dir, artifacts.run_id)
 
-    print("\nStarting hardened Multi-Agent Textbook Update System\n")
+    log_event(
+        logger,
+        logging.INFO,
+        "Starting hardened Multi-Agent Textbook Update System",
+        input_file=settings.input_file,
+        demo_mode=settings.demo_mode,
+        chapter_limit=settings.chapter_limit,
+    )
 
     book = load_book(settings.input_file)
     _save_book_artifacts(store, book)
+    update_store = PersistentUpdateStore(settings.update_store_dir, settings.input_file, book.book_title)
 
     chapters = book.chapters
     if settings.chapter_limit:
@@ -96,12 +133,25 @@ def run_pipeline(settings: PipelineSettings | None = None) -> Dict:
     final_updates: List[WrittenUpdate] = []
 
     for chapter in chapters:
-        print("\n" + "=" * 60)
-        print(f"Processing Chapter: {chapter.title}")
-        print("=" * 60)
+        chapter_start = time.time()
+        existing_written = update_store.chapter_updates(chapter.chapter_id)
+        log_event(
+            logger,
+            logging.INFO,
+            "Processing chapter",
+            chapter_id=chapter.chapter_id,
+            chapter_title=chapter.title,
+        )
 
         if not chapter.content or len(chapter.content.split()) < 100:
-            print("Skipping weak chapter")
+            log_event(
+                logger,
+                logging.INFO,
+                "Skipping weak chapter",
+                chapter_id=chapter.chapter_id,
+                word_count=len(chapter.content.split()) if chapter.content else 0,
+            )
+            final_updates.extend(existing_written)
             continue
 
         stats.chapters_processed += 1
@@ -118,11 +168,24 @@ def run_pipeline(settings: PipelineSettings | None = None) -> Dict:
         all_results_raw: List[Dict] = []
 
         for refined in plan.refined_queries:
-            print(f"\nQuery: {refined}")
+            log_event(
+                logger,
+                logging.INFO,
+                "Running retrieval query",
+                chapter_id=chapter.chapter_id,
+                query=refined,
+            )
             results = retrieve_all(refined)
             if settings.demo_mode:
                 results = results[: settings.retrieval_preview_limit]
-            print(f"Retrieved: {len(results)}")
+            log_event(
+                logger,
+                logging.INFO,
+                "Retrieved results for query",
+                chapter_id=chapter.chapter_id,
+                query=refined,
+                retrieved=len(results),
+            )
             all_results_raw.extend(results)
 
         artifacts.query_plans[chapter.chapter_id] = plan
@@ -132,7 +195,13 @@ def run_pipeline(settings: PipelineSettings | None = None) -> Dict:
         )
 
         if not all_results_raw:
-            print("No retrieval results")
+            log_event(
+                logger,
+                logging.INFO,
+                "No retrieval results for chapter",
+                chapter_id=chapter.chapter_id,
+            )
+            final_updates.extend(existing_written)
             continue
 
         deduped = dedupe_retrieval_results(all_results_raw)
@@ -149,6 +218,7 @@ def run_pipeline(settings: PipelineSettings | None = None) -> Dict:
             candidates,
         )
         if not candidates:
+            final_updates.extend(existing_written)
             continue
 
         judged = judge_candidates(analysis.model_dump(), candidates)
@@ -175,17 +245,64 @@ def run_pipeline(settings: PipelineSettings | None = None) -> Dict:
             for item in ranked
         ]
 
-        if not ranked:
+        if not ranked and not existing_written:
             continue
 
-        written_raw = write_updates(chapter, ranked)
-        chapter_written = [_to_written_update(chapter.chapter_id, item) for item in written_raw]
-        final_updates.extend(chapter_written)
+        chapter_written = []
+        if ranked:
+            written_raw = write_updates(chapter, ranked)
+            chapter_written = [_to_written_update(chapter.chapter_id, item) for item in written_raw]
+
+        existing_rankable = [_written_update_to_rankable(item) for item in existing_written]
+        new_rankable = [_written_update_to_rankable(item) for item in chapter_written]
+        survivor_rankables, removed_rankables = competitive_replacement(
+            existing_rankable,
+            new_rankable,
+            threshold=settings.max_total_updates_per_chapter,
+        )
+
+        survivor_lookup = {
+            (
+                item.title if hasattr(item, "title") else item.get("candidate_title", ""),
+                item.section_id if hasattr(item, "section_id") else item.get("mapped_section_id", ""),
+            ): item
+            for item in existing_written + chapter_written
+        }
+        survivor_written = []
+        removed_written = []
+        for item in survivor_rankables:
+            key = (item.get("candidate_title", ""), item.get("mapped_section_id", ""))
+            if key in survivor_lookup:
+                survivor_written.append(survivor_lookup[key])
+        for item in removed_rankables:
+            key = (item.get("candidate_title", ""), item.get("mapped_section_id", ""))
+            if key in survivor_lookup:
+                removed_written.append(survivor_lookup[key])
+
+        update_store.save_chapter_state(chapter.chapter_id, survivor_written, removed_written, artifacts.run_id)
+        final_updates.extend(survivor_written)
         store.write_json(
             f"chapters/{chapter.chapter_id}/written_updates.json",
-            [item.model_dump(mode="json") for item in chapter_written],
+            [item.model_dump(mode="json") for item in survivor_written],
         )
-        stats.final_updates += len(chapter_written)
+        store.write_json(
+            f"chapters/{chapter.chapter_id}/replacement_audit.json",
+            {
+                "survivors": [item.model_dump(mode="json") for item in survivor_written],
+                "removed": [item.model_dump(mode="json") for item in removed_written],
+            },
+        )
+        stats.final_updates += len(survivor_written)
+        log_event(
+            logger,
+            logging.INFO,
+            "Completed chapter processing",
+            chapter_id=chapter.chapter_id,
+            elapsed_seconds=round(time.time() - chapter_start, 2),
+            accepted_candidates=len(ranked),
+            written_updates=len(survivor_written),
+            replaced_updates=len(removed_written),
+        )
 
     artifacts.written_updates = final_updates
     artifacts.prompt_traces = [PromptTrace(**trace) for trace in get_prompt_traces()]
@@ -201,9 +318,9 @@ def run_pipeline(settings: PipelineSettings | None = None) -> Dict:
         ok, engine, manifest_path = export_docx(book, final_updates, settings.output_docx)
         store.write_text("outputs/docx_export_manifest_path.txt", str(manifest_path))
         if ok:
-            print(f"DOCX generated via {engine}: {settings.output_docx}")
+            log_event(logger, logging.INFO, "DOCX generated", engine=engine, output=settings.output_docx)
         else:
-            print(f"DOCX export skipped: {engine}")
+            log_event(logger, logging.WARNING, "DOCX export skipped", reason=engine)
 
     save_results(
         {
@@ -222,9 +339,9 @@ def run_pipeline(settings: PipelineSettings | None = None) -> Dict:
             str(export_manifest_path),
         )
         if ok:
-            print(f"PDF generated via {engine}: {settings.output_pdf}")
+            log_event(logger, logging.INFO, "PDF generated", engine=engine, output=settings.output_pdf)
         else:
-            print(f"PDF export skipped: {engine}")
+            log_event(logger, logging.WARNING, "PDF export skipped", reason=engine)
 
     elapsed = round(time.time() - start_time, 2)
     summary = {
@@ -246,15 +363,16 @@ def run_pipeline(settings: PipelineSettings | None = None) -> Dict:
 
     store.write_json("run_summary.json", summary)
 
-    print("\n" + "=" * 60)
-    print("RUN SUMMARY")
-    print("=" * 60)
-    print(f"Run ID: {artifacts.run_id}")
-    print(f"Chapters processed: {stats.chapters_processed}")
-    print(f"Candidates generated: {stats.candidates_generated}")
-    print(f"Accepted candidates: {stats.accepted_candidates}")
-    print(f"Final updates written: {stats.final_updates}")
-    print(f"Total time: {elapsed}s")
-    print("=" * 60)
+    log_event(
+        logger,
+        logging.INFO,
+        "Run summary",
+        run_id=artifacts.run_id,
+        chapters_processed=stats.chapters_processed,
+        candidates_generated=stats.candidates_generated,
+        accepted_candidates=stats.accepted_candidates,
+        final_updates=stats.final_updates,
+        elapsed_seconds=elapsed,
+    )
 
     return summary

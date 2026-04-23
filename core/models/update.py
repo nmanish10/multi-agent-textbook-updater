@@ -13,6 +13,12 @@ class SourceRecord(BaseModel):
     source_type: str = ""
     source_name: str = ""
     credibility_score: Optional[float] = None
+    venue: str = ""
+    cited_by_count: Optional[int] = None
+    citation_velocity: Optional[float] = None
+    recency_score: Optional[float] = None
+    author_signal: Optional[float] = None
+    venue_score: Optional[float] = None
     summary: str = ""
 
 

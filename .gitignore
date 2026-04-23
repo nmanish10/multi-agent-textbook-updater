@@ -21,6 +21,13 @@ venv/
 # Caches
 # -------------------------
 .llm_cache/
+.pytest_cache/
+
+# -------------------------
+# Databases
+# -------------------------
+*.sqlite
+*.db
 
 # -------------------------
 # Outputs (Generated Files)

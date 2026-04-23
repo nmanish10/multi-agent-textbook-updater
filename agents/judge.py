@@ -1,9 +1,12 @@
 import re
+import logging
 
+from core.logging import get_logger, log_event
 from core.prompts import prompt_version
 from schemas.schemas import JudgeScore
 from utils.llm import call_mistral_structured
 
+logger = get_logger("textbook_updater.judge")
 
 def tokenize(text):
     text = text.lower()
@@ -40,19 +43,34 @@ def adjust_scores(cand, scores, chapter_analysis):
     source_credibility = extract_source_credibility(cand)
     retrieval_score = float(cand.get("retrieval_score", 0) or 0)
     semantic_score = float(cand.get("semantic_score", 0) or 0)
+    recency_score = float(cand.get("recency_score", 0.5) or 0.5)
+    citation_velocity = float(cand.get("citation_velocity", 0.5) or 0.5)
+    author_signal = float(cand.get("author_signal", 0.5) or 0.5)
+    venue_score = float(cand.get("venue_score", 0.5) or 0.5)
 
     if source_type == "web":
-        scores["credibility"] *= 0.88
+        scores["credibility"] *= 0.95
     elif source_type == "paper":
         scores["credibility"] = min(scores["credibility"] * 1.08, 1.0)
     elif source_type == "preprint":
         scores["credibility"] *= 0.94
+    elif source_type == "official_source":
+        scores["credibility"] = min(scores["credibility"] * 1.12, 1.0)
+        scores["significance"] = min(scores["significance"] + 0.08, 1.0)
 
-    scores["credibility"] = min(1.0, 0.55 * scores["credibility"] + 0.45 * source_credibility)
+    scores["credibility"] = min(
+        1.0,
+        0.13 * scores["credibility"]
+        + 0.57 * source_credibility
+        + 0.10 * venue_score
+        + 0.10 * author_signal
+        + 0.10 * citation_velocity,
+    )
 
     overlap = compute_concept_overlap(chapter_analysis, cand)
-    scores["relevance"] = min(scores["relevance"] + 0.18 * overlap + 0.08 * semantic_score, 1.0)
-    scores["significance"] = min(scores["significance"] + 0.05 * retrieval_score, 1.0)
+    scores["relevance"] = min(scores["relevance"] + 0.18 * overlap + 0.08 * semantic_score + 0.04 * recency_score, 1.0)
+    scores["significance"] = min(scores["significance"] + 0.05 * retrieval_score + 0.05 * citation_velocity, 1.0)
+    scores["novelty"] = min(scores["novelty"] + 0.06 * recency_score, 1.0)
 
     if overlap < 0.15:
         scores["relevance"] *= 0.68
@@ -140,16 +158,7 @@ Return JSON ONLY:
             cand["judge_reason"] = scores.get("reason", "")
             judged.append(cand)
         except Exception as e:
-            print(f"WARNING: Skipping candidate (judge failed): {str(e)}")
-
-    print("\nCandidate Evaluation:")
-    for cand in judged:
-        print(
-            f"- {cand.get('candidate_title')[:50]} | "
-            f"Final: {cand['scores'].get('final_score', 0):.2f} | "
-            f"Rel: {cand['scores'].get('relevance', 0):.2f} | "
-            f"Cred: {cand['scores'].get('credibility', 0):.2f}"
-        )
+            log_event(logger, logging.WARNING, "Judge failed for candidate", error=str(e), candidate_title=cand.get("candidate_title", ""))
 
     filtered = [
         cand
@@ -161,5 +170,11 @@ Return JSON ONLY:
         and cand["scores"].get("significance", 0) >= 0.65
     ]
 
-    print(f"\nAccepted: {len(filtered)} / {len(judged)}\n")
+    log_event(
+        logger,
+        logging.INFO,
+        "Completed candidate judging",
+        judged_candidates=len(judged),
+        accepted_candidates=len(filtered),
+    )
     return filtered

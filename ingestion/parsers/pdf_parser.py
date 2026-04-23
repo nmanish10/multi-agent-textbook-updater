@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple
@@ -137,6 +138,90 @@ def _convert_pdf_to_md_pypdf(pdf_path: str, output_path: str) -> str:
     md_lines = _deduplicate(md_lines)
     Path(output_path).write_text("\n".join(md_lines), encoding="utf-8")
     return output_path
+
+
+def _lines_to_markdown(raw_lines: List[str], output_path: str) -> str:
+    md_lines: List[str] = []
+    seen_chapters = set()
+    found_chapter = False
+
+    for line in raw_lines:
+        chapter = _extract_chapter(line)
+        if chapter and chapter not in seen_chapters:
+            seen_chapters.add(chapter)
+            found_chapter = True
+            md_lines.append(f"\n# {chapter}\n")
+            continue
+
+        if _is_all_caps_heading(line):
+            md_lines.append(f"\n## {line.title()}\n")
+            continue
+
+        sections = _extract_sections(line)
+        if sections:
+            for section in sections:
+                md_lines.append(f"\n## {section.strip()}\n")
+                line = line.replace(section, "").strip()
+
+        if line:
+            md_lines.append(line)
+
+    md_lines = _merge_lines(md_lines)
+    if not found_chapter:
+        fallback_lines = []
+        for line in md_lines:
+            if re.match(r"^\d+\s+[A-Za-z]", line):
+                fallback_lines.append(f"\n# {line}\n")
+            else:
+                fallback_lines.append(line)
+        md_lines = fallback_lines
+
+    md_lines = _deduplicate(md_lines)
+    Path(output_path).write_text("\n".join(md_lines), encoding="utf-8")
+    return output_path
+
+
+def _ocr_runtime_status() -> tuple[bool, str]:
+    if os.getenv("OCR_ENABLED", "false").lower() != "true":
+        return False, "OCR disabled by configuration"
+
+    try:
+        import pytesseract  # noqa: F401
+        import pdf2image  # noqa: F401
+    except Exception as exc:
+        return False, f"OCR dependencies unavailable: {exc}"
+
+    tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
+    if tesseract_cmd:
+        if not Path(tesseract_cmd).exists():
+            return False, f"Tesseract command not found at {tesseract_cmd}"
+        return True, "OCR runtime ready"
+
+    if shutil.which("tesseract"):
+        return True, "OCR runtime ready"
+
+    return False, "Tesseract executable not found in PATH; set TESSERACT_CMD or install Tesseract"
+
+
+def _convert_pdf_to_md_ocr(pdf_path: str, output_path: str) -> str:
+    import pytesseract
+    from pdf2image import convert_from_path
+
+    tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
+    if tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
+    poppler_path = os.getenv("POPPLER_PATH", "").strip() or None
+    images = convert_from_path(pdf_path, dpi=200, poppler_path=poppler_path)
+    raw_lines: List[str] = []
+    for image in images:
+        text = pytesseract.image_to_string(image) or ""
+        for line in text.splitlines():
+            cleaned = _clean_line(line)
+            if cleaned:
+                raw_lines.append(cleaned)
+
+    return _lines_to_markdown(raw_lines, output_path)
 
 
 def _score_book(book: Book) -> Tuple[float, List[str]]:
@@ -327,10 +412,15 @@ def _run_strategy(
 def parse_pdf_document(file_path: str) -> Book:
     ensure_utf8_console()
 
+    scanned_pages, ocr_recommended, page_warnings = _analyze_pdf_pages(file_path)
+
     strategies: List[Tuple[str, Callable[[str, str], str]]] = [
         ("pdfplumber_bridge", convert_pdf_to_md),
         ("pypdf_bridge", _convert_pdf_to_md_pypdf),
     ]
+    ocr_available, ocr_status = _ocr_runtime_status()
+    if ocr_available and ocr_recommended:
+        strategies.append(("ocr_fallback", _convert_pdf_to_md_ocr))
 
     candidates: List[Tuple[Book, Dict]] = []
     candidate_scores: List[dict] = []
@@ -351,6 +441,17 @@ def parse_pdf_document(file_path: str) -> Book:
                 }
             )
 
+    if ocr_recommended and not ocr_available:
+        candidate_scores.append(
+            {
+                "strategy": "ocr_fallback",
+                "score": -1,
+                "chapters": 0,
+                "sections": 0,
+                "warnings": [ocr_status],
+            }
+        )
+
     if not candidates:
         raise ValueError("All PDF parsing strategies failed")
 
@@ -365,8 +466,9 @@ def parse_pdf_document(file_path: str) -> Book:
     )
 
     confidence = 0.9 if best_details["score"] >= 20 else 0.82 if best_details["score"] >= 12 else 0.72
-    scanned_pages, ocr_recommended, page_warnings = _analyze_pdf_pages(file_path)
     warnings.extend(page_warnings)
+    if ocr_recommended:
+        warnings.append(ocr_status)
     parsed = _attach_metadata(
         best_book,
         file_path,

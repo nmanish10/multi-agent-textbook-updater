@@ -4,8 +4,11 @@ from .schemas import (
     CandidateUpdate,
     Chapter,
     ChapterAnalysisScore,
+    ExtractedEvidence,
     JudgeScore,
     Section,
+    SectionMapping,
+    WriterOutput,
 )
 
 __all__ = [
@@ -14,6 +17,9 @@ __all__ = [
     "CandidateUpdate",
     "Chapter",
     "ChapterAnalysisScore",
+    "ExtractedEvidence",
     "JudgeScore",
     "Section",
+    "SectionMapping",
+    "WriterOutput",
 ]

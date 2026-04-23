@@ -98,6 +98,12 @@ Each run can generate a review pack through `review/review_pack.py`:
 
 This gives a human reviewer a clean approval or revision surface instead of raw artifacts only.
 
+### 13. Review decision ingestion
+Reviewer decisions can be re-applied through `review/decision_ingest.py`, which turns `review_queue.csv` into:
+- an approval summary
+- approved and pending update JSON files
+- an approved Markdown textbook export
+
 ## Document Model
 The canonical document model is defined in [core/models/book.py](./core/models/book.py).
 
@@ -145,9 +151,10 @@ This means the system now preserves more than plain text. It can carry figures, 
 - records strategy scores and parse warnings
 - detects low-text or image-heavy pages
 - flags `ocr_recommended` when the PDF appears scan-heavy
+- can run an optional OCR fallback strategy when `OCR_ENABLED=true` and the OCR runtime is installed
 
 ### Important PDF note
-True OCR fallback is not yet active in this environment because OCR-specific dependencies are not installed. The system now detects likely scanned PDFs and reports that OCR is recommended instead of silently overtrusting a weak parse.
+OCR fallback is optional. If OCR dependencies are not installed, the system still detects likely scanned PDFs and reports that OCR is recommended instead of silently overtrusting a weak parse.
 
 ## Rendering and Output
 
@@ -217,7 +224,19 @@ Recommended workflow:
 2. Inspect the parse warnings and OCR recommendation if present.
 3. Review accepted updates in `review_pack.md`.
 4. Fill `review_queue.csv` with `approve`, `revise`, or `reject`.
-5. Use reviewer notes to guide downstream editing or future automation.
+5. Apply the decisions with:
+
+```bash
+python main.py --apply-review-queue outputs/artifacts/<run_id>/review/review_queue.csv --review-run-dir outputs/artifacts/<run_id>
+```
+
+6. Use reviewer notes to guide downstream editing or future automation.
+
+Applying review decisions produces:
+- `review/review_decision_summary.json`
+- `review/approved_updates.json`
+- `review/pending_review_updates.json`
+- `review/approved_book.md`
 
 ## Prompt and Run Tracing
 The system records prompt usage through:
@@ -244,6 +263,7 @@ python main.py --input-file data/sample.md --skip-pdf
 python main.py --input-file data/sample.pdf --full-run
 python main.py --input-file data/sample.docx --skip-review-pack
 python main.py --input-file data/sample.html --chapter-limit 2
+python main.py --apply-review-queue outputs/artifacts/<run_id>/review/review_queue.csv --review-run-dir outputs/artifacts/<run_id>
 ```
 
 ### CLI flags
@@ -254,6 +274,9 @@ python main.py --input-file data/sample.html --chapter-limit 2
 - `--skip-pdf`
 - `--skip-docx`
 - `--skip-review-pack`
+- `--apply-review-queue`
+- `--review-run-dir`
+- `--approved-markdown`
 
 ## Environment and Configuration
 Settings are managed through [core/config.py](./core/config.py) and can be configured by environment variables.
@@ -273,6 +296,9 @@ Important settings include:
 - `RENDER_DOCX`
 - `GENERATE_REVIEW_PACK`
 - `PANDOC_COMMAND`
+- `OCR_ENABLED`
+- `TESSERACT_CMD`
+- `POPPLER_PATH`
 
 ## Installation
 
@@ -294,6 +320,9 @@ Example:
 
 ```env
 MISTRAL_API_KEY=your_api_key_here
+OCR_ENABLED=false
+TESSERACT_CMD=
+POPPLER_PATH=
 ```
 
 ## Dependencies
@@ -310,6 +339,17 @@ Core dependencies currently used include:
 - `aiohttp`
 - `diskcache`
 - `Pillow`
+
+## OCR Setup
+True OCR fallback still requires system tooling plus Python bindings. On Windows, the recommended install path is:
+
+```powershell
+winget install --id UB-Mannheim.TesseractOCR -e
+winget install --id oschwartz10612.Poppler -e
+venv\Scripts\python.exe -m pip install pytesseract pdf2image PyMuPDF
+```
+
+If `winget` is not available, install Tesseract manually and add its install directory to `PATH`. Poppler is recommended for rasterizing PDF pages during OCR fallback workflows.
 
 ## Testing
 The regression suite covers parsing, rendering, export, decision quality, prompt tracing, multimodal preservation, and review-pack generation.
@@ -330,22 +370,20 @@ venv\Scripts\python.exe tests\run_tests.py
 - artifact persistence
 - regression tests
 - human review pack generation
+- review-decision ingestion
 
 ## Known Limitations
-- full OCR fallback is not yet installed or active
 - PDF table and figure placement remains best-effort
-- no database-backed persistence yet
 - no scheduler or version-diff workflow yet
 - no dedicated UI or dashboard yet
-- no automated loop yet that re-ingests reviewer decisions
+- reviewer decisions do not yet gate DOCX/PDF publication automatically
 
 ## Highest-Value Next Steps
-- install and wire real OCR fallback for scanned PDFs
-- add table and figure placement improvements for difficult PDFs
-- add reviewer-decision ingestion and approval gating
+- build a multi-signal credibility model for author and venue scoring (P3)
+- integrate official sources for benchmarks and standards (P4)
+- build the Next.js Learning Platform UI (P6)
+- add approval gating from reviewer decisions into downstream DOCX/PDF publication
 - add version tracking and scheduled reruns
-- add optional database-backed persistence
-- enable a stronger `pandoc` publishing path where available
 
 ## Output Files
 Common outputs include:

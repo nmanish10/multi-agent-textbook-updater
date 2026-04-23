@@ -178,7 +178,9 @@ def call_mistral_structured(
     struct_sys_prompt = system_prompt or "You are a helpful assistant."
     struct_sys_prompt += (
         "\n\nYou MUST return raw JSON ONLY. Do not write markdown blocks or text. "
-        f"Your JSON must abide by this strict schema:\n{json.dumps(schema_json)}"
+        "Your output must be a fully populated JSON object that represents a valid instance of this schema. "
+        "Do NOT return the schema definition itself. Here is the schema you must fulfill:\n"
+        f"{json.dumps(schema_json)}"
     )
 
     temperature = get_temperature(prompt)

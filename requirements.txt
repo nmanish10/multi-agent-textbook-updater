@@ -13,3 +13,6 @@ markdown
 xhtml2pdf
 python-docx
 Pillow
+pytesseract 
+pdf2image 
+PyMuPDF

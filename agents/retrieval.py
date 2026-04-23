@@ -1,4 +1,6 @@
 import asyncio
+from datetime import datetime, timezone
+import logging
 import re
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -6,8 +8,11 @@ import aiohttp
 from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer, util
 
+from core.logging import get_logger, log_event
 
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+logger = get_logger("textbook_updater.retrieval")
+embedding_model = None
+embedding_model_failed = False
 
 
 TRUSTED_WEB_DOMAINS = {
@@ -24,6 +29,34 @@ TRUSTED_WEB_DOMAINS = {
     "wikipedia.org": 0.55,
 }
 
+OFFICIAL_SOURCE_REGISTRY = {
+    "openai": {"label": "OpenAI", "domain": "openai.com", "query_prefix": "site:openai.com", "credibility": 0.98},
+    "google_deepmind": {
+        "label": "Google DeepMind",
+        "domain": "deepmind.google",
+        "query_prefix": "site:deepmind.google",
+        "credibility": 0.98,
+    },
+    "meta_ai": {"label": "Meta AI", "domain": "ai.meta.com", "query_prefix": "site:ai.meta.com", "credibility": 0.96},
+    "nist": {"label": "NIST", "domain": "nist.gov", "query_prefix": "site:nist.gov", "credibility": 0.98},
+    "ieee": {"label": "IEEE", "domain": "ieee.org", "query_prefix": "site:ieee.org", "credibility": 0.96},
+}
+
+VENUE_TIERS = {
+    "neurips": 0.95,
+    "icml": 0.95,
+    "iclr": 0.95,
+    "nature": 0.95,
+    "science": 0.95,
+    "aaai": 0.88,
+    "emnlp": 0.88,
+    "cvpr": 0.88,
+    "acl": 0.88,
+    "ieee": 0.82,
+    "acm": 0.82,
+    "arxiv": 0.55,
+}
+
 LOW_SIGNAL_DOMAINS = {
     "medium.com",
     "towardsdatascience.com",
@@ -34,6 +67,26 @@ LOW_SIGNAL_DOMAINS = {
     "x.com",
     "twitter.com",
 }
+
+
+def get_embedding_model():
+    global embedding_model, embedding_model_failed
+    if embedding_model is not None:
+        return embedding_model
+    if embedding_model_failed:
+        return None
+    try:
+        embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+    except Exception as exc:
+        embedding_model_failed = True
+        log_event(
+            logger,
+            logging.WARNING,
+            "Embedding model unavailable; falling back to lexical relevance",
+            error=str(exc),
+        )
+        return None
+    return embedding_model
 
 
 def generate_queries(query):
@@ -80,6 +133,12 @@ def extract_domain(url):
 
 
 def infer_credibility(source_type, url):
+    if source_type == "official_source":
+        domain = extract_domain(url)
+        for entry in OFFICIAL_SOURCE_REGISTRY.values():
+            if domain.endswith(entry["domain"]):
+                return entry["credibility"]
+        return 0.95
     if source_type == "paper":
         return 0.95
     if source_type == "preprint":
@@ -97,10 +156,105 @@ def infer_credibility(source_type, url):
     return 0.45
 
 
+def months_since(date_value):
+    if not date_value:
+        return 12.0
+    try:
+        if isinstance(date_value, int):
+            parsed = datetime(int(date_value), 1, 1, tzinfo=timezone.utc)
+        else:
+            text = str(date_value).strip()
+            parsed = None
+            for fmt, length in [("%Y-%m-%d", 10), ("%Y-%m", 7), ("%Y", 4)]:
+                try:
+                    parsed = datetime.strptime(text[:length], fmt).replace(tzinfo=timezone.utc)
+                    break
+                except ValueError:
+                    continue
+            if parsed is None:
+                return 12.0
+        delta_days = max((datetime.now(timezone.utc) - parsed).days, 0)
+        return max(delta_days / 30.0, 0.1)
+    except Exception:
+        return 12.0
+
+
+def compute_recency_score(date_value):
+    return round(max(0.30, 1.0 - (months_since(date_value) / 24.0)), 4)
+
+
+def compute_citation_velocity(cited_by_count, date_value):
+    if not cited_by_count:
+        return 0.5
+    velocity = float(cited_by_count) / max(months_since(date_value), 0.1)
+    return round(min(velocity / 20.0, 1.0), 4)
+
+
+def infer_venue_score(venue, source_type):
+    venue_text = (venue or "").lower()
+    for key, score in VENUE_TIERS.items():
+        if key in venue_text:
+            return score
+    if source_type == "official_source":
+        return 0.95
+    if source_type == "paper":
+        return 0.75
+    if source_type == "preprint":
+        return 0.55
+    return 0.5
+
+
+def infer_author_signal(item):
+    works_count = float(item.get("author_works_count", 0) or 0)
+    cited_by = float(item.get("author_cited_by_count", 0) or 0)
+    if works_count <= 0 or cited_by <= 0:
+        return 0.5
+    pseudo_h_index = (cited_by / max(works_count, 1)) ** 0.5 * 5
+    return round(min(pseudo_h_index / 50.0, 1.0), 4)
+
+
+def source_channel_score(source_type):
+    return {
+        "peer_reviewed_journal": 0.92,
+        "conference_paper": 0.90,
+        "official_source": 0.95,
+        "paper": 0.90,
+        "preprint": 0.60,
+        "web": 0.40,
+    }.get(source_type, 0.50)
+
+
+def compute_credibility(item):
+    source_type = item.get("source_type", "")
+    url = item.get("url", "")
+    venue_score = infer_venue_score(item.get("venue", ""), source_type)
+    author_signal = infer_author_signal(item)
+    recency_score = compute_recency_score(item.get("date"))
+    citation_velocity = compute_citation_velocity(item.get("cited_by_count"), item.get("date"))
+    channel_score = source_channel_score(source_type)
+    domain_floor = infer_credibility(source_type, url)
+
+    score = (
+        0.30 * venue_score
+        + 0.25 * author_signal
+        + 0.20 * recency_score
+        + 0.15 * citation_velocity
+        + 0.10 * channel_score
+    )
+    score = max(score, domain_floor)
+    return {
+        "credibility_score": round(min(score, 1.0), 4),
+        "venue_score": round(venue_score, 4),
+        "author_signal": round(author_signal, 4),
+        "recency_score": round(recency_score, 4),
+        "citation_velocity": round(citation_velocity, 4),
+    }
+
+
 def normalize_result(item):
     url = canonicalize_url(item.get("url"))
     source_type = item.get("source_type")
-    return {
+    normalized = {
         "title": (item.get("title") or "").strip(),
         "summary": (item.get("summary") or "").strip(),
         "source": item.get("source"),
@@ -109,8 +263,13 @@ def normalize_result(item):
         "date": item.get("date"),
         "url": url,
         "domain": extract_domain(url),
-        "credibility_score": infer_credibility(source_type, url),
+        "venue": item.get("venue", ""),
+        "cited_by_count": item.get("cited_by_count"),
+        "author_works_count": item.get("author_works_count"),
+        "author_cited_by_count": item.get("author_cited_by_count"),
     }
+    normalized.update(compute_credibility(normalized))
+    return normalized
 
 
 def is_valid_result(item):
@@ -128,8 +287,15 @@ def compute_relevance(query, result):
     doc_text = result["title"] + " " + result["summary"]
     if not doc_text.strip():
         return 0.0
-    target_emb = embedding_model.encode(query, convert_to_tensor=True)
-    doc_emb = embedding_model.encode(doc_text, convert_to_tensor=True)
+    model = get_embedding_model()
+    if model is None:
+        query_tokens = set(simplify_query(query, max_words=12).lower().split())
+        doc_tokens = set(re.findall(r"\b[a-z0-9]+\b", doc_text.lower()))
+        if not query_tokens or not doc_tokens:
+            return 0.0
+        return len(query_tokens & doc_tokens) / len(query_tokens | doc_tokens)
+    target_emb = model.encode(query, convert_to_tensor=True)
+    doc_emb = model.encode(doc_text, convert_to_tensor=True)
     return util.cos_sim(target_emb, doc_emb)[0][0].item()
 
 
@@ -191,6 +357,16 @@ async def search_openalex(query, session: aiohttp.ClientSession):
                         "source_type": "paper",
                         "date": item.get("publication_year"),
                         "url": doi,
+                        "venue": ((item.get("primary_location") or {}).get("source") or {}).get("display_name", ""),
+                        "cited_by_count": item.get("cited_by_count"),
+                        "author_works_count": sum(
+                            ((author.get("author") or {}).get("works_count", 0) or 0)
+                            for author in item.get("authorships", [])[:3]
+                        ),
+                        "author_cited_by_count": sum(
+                            ((author.get("author") or {}).get("cited_by_count", 0) or 0)
+                            for author in item.get("authorships", [])[:3]
+                        ),
                     }
                 )
                 if is_valid_result(result):
@@ -224,6 +400,7 @@ async def search_arxiv(query, session: aiohttp.ClientSession):
                         "source_type": "preprint",
                         "date": (published.group(1)[:10] if published else ""),
                         "url": link.group(1) if link else "",
+                        "venue": "arXiv",
                     }
                 )
                 if is_valid_result(result):
@@ -262,6 +439,42 @@ async def search_web(query, session: aiohttp.ClientSession):
         return []
 
 
+async def search_official_sources(query, session: aiohttp.ClientSession):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    results = []
+    for source in OFFICIAL_SOURCE_REGISTRY.values():
+        scoped_query = f"{source['query_prefix']} {query}"
+        try:
+            async with session.post(
+                "https://html.duckduckgo.com/html/",
+                headers=headers,
+                data={"q": scoped_query},
+                timeout=10,
+            ) as res:
+                text_data = await res.text()
+                soup = BeautifulSoup(text_data, "html.parser")
+                for item in soup.select(".result")[:2]:
+                    title = item.select_one(".result__title")
+                    snippet = item.select_one(".result__snippet")
+                    link = item.select_one("a.result__a")
+                    result = normalize_result(
+                        {
+                            "title": title.get_text(strip=True) if title else "",
+                            "summary": snippet.get_text(strip=True) if snippet else "",
+                            "source": source["label"],
+                            "source_name": source["label"],
+                            "source_type": "official_source",
+                            "url": link["href"] if link else "",
+                            "venue": source["label"],
+                        }
+                    )
+                    if result["domain"].endswith(source["domain"]) and is_valid_result(result):
+                        results.append(result)
+        except Exception:
+            continue
+    return results
+
+
 async def retrieve_all_async(query):
     queries = generate_queries(query)
     all_results = []
@@ -271,6 +484,7 @@ async def retrieve_all_async(query):
             tasks.append(search_openalex(refined_query, session))
             tasks.append(search_arxiv(refined_query, session))
             tasks.append(search_web(refined_query, session))
+            tasks.append(search_official_sources(refined_query, session))
 
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
         for item in gathered:
@@ -280,10 +494,11 @@ async def retrieve_all_async(query):
 
 
 def retrieve_all(query):
-    print(f"\nSearching (Concurrent): {query}")
+    log_event(logger, logging.INFO, "Starting retrieval", query=query)
     all_results = asyncio.run(retrieve_all_async(query))
     all_results = deduplicate_results(all_results)
     if not all_results:
+        log_event(logger, logging.INFO, "No retrieval results after deduplication", query=query)
         return []
 
     scored = [score_result(query, result) for result in all_results]
@@ -293,5 +508,12 @@ def retrieve_all(query):
         reverse=True,
     )
     final_results = scored[:8]
-    print(f"Total relevant results: {len(final_results)}\n")
+    log_event(
+        logger,
+        logging.INFO,
+        "Completed retrieval",
+        query=query,
+        total_candidates=len(all_results),
+        returned_results=len(final_results),
+    )
     return final_results

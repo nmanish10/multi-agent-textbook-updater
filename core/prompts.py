@@ -1,9 +1,9 @@
 PROMPT_VERSIONS = {
     "chapter_analysis": "1.0",
-    "evidence_extraction": "1.0",
+    "evidence_extraction": "2.0",
     "judge_candidate": "1.0",
-    "section_mapping": "1.0",
-    "writer_addendum": "1.0",
+    "section_mapping": "2.0",
+    "writer_addendum": "2.0",
 }
 
 

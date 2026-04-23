@@ -1,53 +1,24 @@
-from core.prompts import prompt_version
-from utils.llm import call_mistral
 import re
 
-
-# -------------------------
-# CLEAN TEXT
-# -------------------------
-def clean_text(response: str):
-    response = response.strip()
-
-    if response.startswith("```"):
-        response = response.replace("```", "").strip()
-
-    response = response.replace("**", "")
-    response = response.replace("*", "")
-
-    response = response.replace("\r", "")
-    response = "\n\n".join(
-        [block.strip() for block in response.split("\n\n") if block.strip()]
-    )
-
-    return response
+from core.prompts import prompt_version
+from schemas.schemas import WriterOutput
+from utils.llm import call_mistral_structured
 
 
 # -------------------------
-# VALIDATION (RELAXED & RESILIENT)
+# CONTENT VALIDATION (post-structured-output)
 # -------------------------
-def is_valid_output(text, section_id):
-    parts = text.split("\n\n")
+def is_quality_output(parsed: WriterOutput, section_id: str) -> bool:
+    """Validate content quality AFTER successful structured parsing.
+    Structure is guaranteed by Pydantic — this checks semantic quality."""
 
-    # Expect title + 2 paragraphs
-    if len(parts) < 3:
+    # Word count check (relaxed from 40 to 30 to prevent dropping concise, well-written updates)
+    if len(parsed.paragraph_1.split()) < 30 or len(parsed.paragraph_2.split()) < 30:
         return False
 
-    title = parts[0]
-    para1 = parts[1]
-    para2 = parts[2]
-
-    # Length checks relaxed from 40 to 30 to prevent dropping concise, well-written updates
-    if len(para1.split()) < 30 or len(para2.split()) < 30:
-        return False
-
-    # Regex search for "Section X.X" to handle case and punctuation differences
+    # Check that paragraph 1 references the target section
     section_pattern = re.compile(rf"section\s+{re.escape(str(section_id))}", re.IGNORECASE)
-    if not section_pattern.search(para1):
-        return False
-
-    # Avoid generic text, but only if it also missed the proper section pattern
-    if "this section" in para1.lower() and not section_pattern.search(para1):
+    if not section_pattern.search(parsed.paragraph_1):
         return False
 
     return True
@@ -108,7 +79,6 @@ def write_updates(chapter, mapped_updates, max_retries=2):
             }]
 
         source_url = upd.get("url", "")
-        subsection_title = upd.get("proposed_subsection") or upd.get("candidate_title")
 
         # -------------------------
         # RECONSTRUCTIVE PROMPT
@@ -128,58 +98,49 @@ Target Section: {section_id}
 
 INSTRUCTIONS:
 1. Ignore any fragmented sentences, merged words, or typographical errors in the Existing Section Context. Extract only the core meaning.
-2. Write exactly two comprehensive paragraphs.
-3. Paragraph 1 (Context & Extension): MUST explicitly state "Section {section_id}". Seamlessly bridge the existing textbook concepts with the new update. Explain WHAT the new development is.
-4. Paragraph 2 (Implications & Example): Explain WHY this matters to a student in this field. You MUST provide a brief, concrete example or theoretical application of this new concept.
+2. For "title": write a concise, descriptive subsection title.
+3. For "paragraph_1" (Context & Extension): MUST explicitly state "Section {section_id}". Seamlessly bridge the existing textbook concepts with the new update. Explain WHAT the new development is.
+4. For "paragraph_2" (Implications & Example): Explain WHY this matters to a student in this field. You MUST provide a brief, concrete example or theoretical application of this new concept.
 
 STRICT CONSTRAINTS:
 - No markdown formatting, bullet points, or bold text.
-- Do not repeat the title in the body.
+- Do not repeat the title in the paragraphs.
 - Maintain an authoritative, educational tone.
-
-FORMAT:
-
-Subsection Title
-
-Paragraph 1
-
-Paragraph 2
+- Each paragraph must be at least 30 words.
 """
 
-        success = False
-
-        for attempt in range(max_retries + 1):
-            response = call_mistral(
+        try:
+            parsed_result = call_mistral_structured(
                 prompt,
+                WriterOutput,
+                system_prompt="You are an expert academic textbook writer producing high-quality textbook addenda.",
+                max_retries=max_retries,
                 prompt_name="writer_addendum",
                 prompt_version=prompt_version("writer_addendum"),
             )
 
-            try:
-                cleaned = clean_text(response)
+            if not is_quality_output(parsed_result, section_id):
+                print(f"⚠️ Writer output failed quality check, using fallback")
+                text = fallback_output(upd, section_id)
+            else:
+                # Reconstruct text in the expected downstream format
+                text = f"{parsed_result.title}\n\n{parsed_result.paragraph_1}\n\n{parsed_result.paragraph_2}"
 
-                if not is_valid_output(cleaned, section_id):
-                    print(f"⚠️ Writer output invalid (attempt {attempt + 1})")
-                    continue
+            final_outputs.append({
+                "section_id": section_id,
+                "text": text,
+                "sources": sources,
+                "source": source_url,
+                "why_it_matters": upd.get("why_it_matters", ""),
+                "scores": upd.get("scores", {}),
+                "mapping_rationale": upd.get("mapping_reason", ""),
+            })
 
-                final_outputs.append({
-                    "section_id": section_id,
-                    "text": cleaned,
-                    "sources": sources,
-                    "source": source_url
-                })
-
-                success = True
-                break
-
-            except Exception:
-                print(f"⚠️ Writer failed (attempt {attempt + 1})")
-
-        # -------------------------
-        # FALLBACK
-        # -------------------------
-        if not success:
-            print("⚠️ Using fallback writer output")
+        except Exception as e:
+            # -------------------------
+            # FALLBACK
+            # -------------------------
+            print(f"⚠️ Writer failed ({e}), using fallback")
 
             fallback = fallback_output(upd, section_id)
 
@@ -187,7 +148,10 @@ Paragraph 2
                 "section_id": section_id,
                 "text": fallback,
                 "sources": sources,
-                "source": source_url
+                "source": source_url,
+                "why_it_matters": upd.get("why_it_matters", ""),
+                "scores": upd.get("scores", {}),
+                "mapping_rationale": upd.get("mapping_reason", ""),
             })
 
     print(f"\n📝 Generated {len(final_outputs)} final updates\n")
