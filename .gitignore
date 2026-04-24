@@ -5,12 +5,14 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.Python
 
 # -------------------------
 # Virtual Environment
 # -------------------------
 venv/
-.env/
+.venv/
+env/
 
 # -------------------------
 # Environment Variables
@@ -22,6 +24,8 @@ venv/
 # -------------------------
 .llm_cache/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # -------------------------
 # Databases
@@ -33,8 +37,8 @@ venv/
 # Outputs (Generated Files)
 # -------------------------
 outputs/
-*.pdf
-*.md
+tmp/
+*.log
 
 # -------------------------
 # OS / Editor
@@ -42,8 +46,11 @@ outputs/
 .DS_Store
 Thumbs.db
 .vscode/
+.idea/
 
 # -------------------------
 # Project Files (Private)
 # -------------------------
 Project Brief Multi Agent Textbook Updater.pdf
+data/AIMA.pdf
+data/MLlecturenotes.pdf

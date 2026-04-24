@@ -68,7 +68,13 @@ Each chapter is analyzed with `agents/chapter_analysis.py` to produce:
 - reasoning summary
 
 ### 5. Retrieval
-`agents/retrieval.py` fetches evidence from academic and web sources, normalizes URLs, applies credibility heuristics, and improves ranking quality.
+`agents/retrieval.py` fetches evidence from academic and web sources, including an official-source lane for standards, benchmark owners, and major AI labs.
+
+Retrieval now combines:
+- source normalization and URL canonicalization
+- official-source discovery for sources such as OpenAI, Google DeepMind, Meta AI, NIST, and IEEE
+- a multi-signal credibility model using venue quality, author signal, recency, citation velocity, and source channel
+- lexical and embedding-aware reranking with graceful fallback when the embedding model is unavailable
 
 ### 6. Evidence extraction
 `agents/evidence_extractor.py` turns raw retrieval results into candidate updates with structured fields.
@@ -77,10 +83,16 @@ Each chapter is analyzed with `agents/chapter_analysis.py` to produce:
 `agents/judge.py` scores candidates on quality and relevance signals and rejects low-value updates.
 
 ### 8. Section mapping
-`agents/section_mapper.py` maps accepted content back to textbook sections using section-aware matching and rationale generation.
+`agents/section_mapper.py` maps accepted content back to textbook sections using a hybrid strategy:
+- semantic similarity when embeddings are available
+- token overlap
+- title overlap
+- LLM fallback only when heuristic confidence is weak
 
 ### 9. Ranking and selection
-`agents/ranker.py` performs final selection, limiting updates per chapter and preferring stronger, less redundant updates.
+`agents/ranker.py` performs final selection in two layers:
+- per-run ranking to keep only the strongest updates for the current chapter pass
+- competitive replacement against previously accepted chapter updates, so each chapter maintains a capped, curated update set over time instead of accumulating forever
 
 ### 10. Writing
 `agents/writer.py` produces textbook-style update prose suitable for insertion as chapter-end addenda.
@@ -98,7 +110,16 @@ Each run can generate a review pack through `review/review_pack.py`:
 
 This gives a human reviewer a clean approval or revision surface instead of raw artifacts only.
 
-### 13. Review decision ingestion
+### 13. Persistent chapter update store
+`storage/update_store.py` keeps surviving updates per book and per chapter.
+
+This enables:
+- competitive replacement across runs
+- curated chapter update thresholds
+- replacement audit trails
+- rendering a "living textbook" from the best surviving updates, not just the latest run
+
+### 14. Review decision ingestion
 Reviewer decisions can be re-applied through `review/decision_ingest.py`, which turns `review_queue.csv` into:
 - an approval summary
 - approved and pending update JSON files
@@ -201,12 +222,27 @@ Typical artifact contents include:
 - candidates
 - accepted updates
 - written updates
+- replacement audit files
 - prompt traces
 - run summary
 - export manifests
 - review pack files
 
-This makes the pipeline resumable in spirit, auditable, and easier to debug.
+The persistent chapter update store lives separately under `outputs/update_store/` and records which updates survived or were replaced across runs.
+
+This makes the pipeline auditable, easier to debug, and much closer to a resumable living-update system.
+
+## Logging and Observability
+The pipeline now uses structured logging through [core/logging.py](./core/logging.py).
+
+It records:
+- run start and completion
+- per-chapter progress
+- retrieval activity and counts
+- export outcomes
+- timing information for major steps
+
+This is a big step up from ad hoc `print()`-based debugging and makes later operational work much easier.
 
 ## Human Review Workflow
 The review workflow is designed for editorial safety.
@@ -249,6 +285,8 @@ The system records prompt usage through:
 
 This information is saved to artifacts so prompt changes are inspectable across runs.
 
+Prompts are still Python-managed today, with version labels tracked in [core/prompts.py](./core/prompts.py). Externalized prompt files are a future enhancement, not the current state.
+
 ## CLI Usage
 The main entrypoint is:
 
@@ -288,8 +326,10 @@ Important settings include:
 - `OUTPUT_PDF`
 - `OUTPUT_DOCX`
 - `ARTIFACT_DIR`
+- `UPDATE_STORE_DIR`
 - `DEMO_MODE`
 - `MAX_UPDATES_PER_CHAPTER`
+- `MAX_TOTAL_UPDATES_PER_CHAPTER`
 - `RETRIEVAL_PREVIEW_LIMIT`
 - `CHAPTER_LIMIT`
 - `RENDER_PDF`
@@ -320,6 +360,8 @@ Example:
 
 ```env
 MISTRAL_API_KEY=your_api_key_here
+MAX_UPDATES_PER_CHAPTER=3
+MAX_TOTAL_UPDATES_PER_CHAPTER=5
 OCR_ENABLED=false
 TESSERACT_CMD=
 POPPLER_PATH=
@@ -352,7 +394,7 @@ venv\Scripts\python.exe -m pip install pytesseract pdf2image PyMuPDF
 If `winget` is not available, install Tesseract manually and add its install directory to `PATH`. Poppler is recommended for rasterizing PDF pages during OCR fallback workflows.
 
 ## Testing
-The regression suite covers parsing, rendering, export, decision quality, prompt tracing, multimodal preservation, and review-pack generation.
+The regression suite covers parsing, rendering, export, decision quality, prompt tracing, multimodal preservation, competitive replacement, OCR fallback, and review workflows.
 
 Run it with:
 
@@ -364,8 +406,14 @@ venv\Scripts\python.exe tests\run_tests.py
 - typed core data model
 - layered architecture
 - multimodal parsing with images, tables, and callouts
+- multi-strategy PDF parsing with OCR-aware scan detection
 - canonical Markdown-first publishing
+- official-source aware retrieval
+- multi-signal credibility scoring
+- hybrid embedding-aware section mapping
+- persistent chapter update storage with competitive replacement
 - DOCX and PDF export
+- structured logging
 - prompt tracing
 - artifact persistence
 - regression tests
@@ -379,11 +427,11 @@ venv\Scripts\python.exe tests\run_tests.py
 - reviewer decisions do not yet gate DOCX/PDF publication automatically
 
 ## Highest-Value Next Steps
-- build a multi-signal credibility model for author and venue scoring (P3)
-- integrate official sources for benchmarks and standards (P4)
-- build the Next.js Learning Platform UI (P6)
-- add approval gating from reviewer decisions into downstream DOCX/PDF publication
-- add version tracking and scheduled reruns
+- externalize prompt management into editable files or templates
+- deepen PDF structure recovery with font-aware headings and TOC-guided reconstruction
+- add approval gating so reviewer-approved content becomes the only publishable DOCX/PDF path
+- add admin config, scheduling, and version-tracking workflows
+- build the Next.js Learning Platform UI
 
 ## Output Files
 Common outputs include:
