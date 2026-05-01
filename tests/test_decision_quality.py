@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 from agents.evidence_extractor import source_signal_score
 from agents.judge import adjust_scores
-from agents.retrieval import canonicalize_url, compute_credibility, infer_credibility, normalize_result
+from agents.retrieval import (
+    canonicalize_url,
+    compute_credibility,
+    infer_credibility,
+    normalize_result,
+    retrieve_all_async,
+)
 from agents.section_mapper import score_sections, top_section_confident
 
 
@@ -85,6 +92,50 @@ class DecisionQualityTests(unittest.TestCase):
         adjusted = adjust_scores(candidate, scores, chapter_analysis)
         self.assertGreaterEqual(adjusted["credibility"], 0.8)
         self.assertIn(adjusted["decision"], {"accept", "reject"})
+
+    def test_adjust_scores_avoids_double_counting_retrieval_credibility(self) -> None:
+        candidate = {
+            "candidate_title": "Recent Methods",
+            "summary": "A highly relevant update for modern model evaluation and benchmarks.",
+            "source_type": "paper",
+            "credibility_score": 0.9,
+            "retrieval_score": 0.6,
+            "semantic_score": 0.6,
+            "citation_velocity": 1.0,
+            "author_signal": 1.0,
+            "venue_score": 1.0,
+        }
+        scores = {
+            "relevance": 0.8,
+            "significance": 0.8,
+            "credibility": 0.4,
+            "novelty": 0.7,
+            "pedagogical_fit": 0.8,
+            "final_score": 0.0,
+            "decision": "reject",
+            "reason": "test",
+        }
+        adjusted = adjust_scores(candidate, scores, {"key_concepts": ["evaluation", "benchmarks"]})
+        self.assertLessEqual(adjusted["credibility"], 0.8)
+        self.assertAlmostEqual(adjusted["credibility"], 0.30 * 0.432 + 0.70 * 0.9, delta=0.03)
+
+    def test_explicit_author_h_index_strengthens_credibility(self) -> None:
+        enriched = compute_credibility(
+            {
+                "source_type": "paper",
+                "url": "https://example.com/semantic-scholar-paper",
+                "date": "2026-02-01",
+                "venue": "ICLR 2026",
+                "cited_by_count": 10,
+                "author_h_index": 42,
+            }
+        )
+        self.assertGreaterEqual(enriched["author_signal"], 0.8)
+        self.assertGreaterEqual(enriched["credibility_score"], 0.8)
+
+    def test_retrieve_all_async_respects_enabled_sources(self) -> None:
+        results = asyncio.run(retrieve_all_async("graph neural networks", enabled_sources=[]))
+        self.assertEqual(results, [])
 
     def test_section_scoring_detects_clear_top_match(self) -> None:
         sections = [

@@ -1,0 +1,43 @@
+version: "1.1"
+system_prompt: |
+  You are a STRICT academic reviewer evaluating new additions for a textbook.
+user_prompt: |
+  You are a STRICT academic reviewer.
+
+  Chapter Summary:
+  {chapter_summary}
+
+  Key Concepts:
+  {key_concepts}
+
+  Candidate:
+  Title: {candidate_title}
+  Summary: {candidate_summary}
+  Why it matters: {candidate_why}
+  Source: {source_type}
+  Date: {source_date}
+
+  Score STRICTLY (0-1):
+
+  - relevance
+  - significance
+  - credibility
+  - novelty
+  - pedagogical_fit
+
+  Rules:
+  - Penalize hyper-niche case studies or unrelated tangents
+  - Reward foundational, algorithmic, or core theoretical advancements
+  - Prefer concepts that broadly generalize across the field
+
+  Return JSON ONLY:
+  {{
+    "relevance": 0.0,
+    "significance": 0.0,
+    "credibility": 0.0,
+    "novelty": 0.0,
+    "pedagogical_fit": 0.0,
+    "final_score": 0.0,
+    "decision": "accept" or "reject",
+    "reason": "short explanation"
+  }}

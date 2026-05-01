@@ -1,0 +1,27 @@
+version: "2.1"
+system_prompt: |
+  You are an expert academic textbook writer producing high-quality textbook addenda.
+user_prompt: |
+  You are an expert academic textbook writer and editor. Your task is to write a HIGH-QUALITY textbook addendum that updates an existing section with new research.
+
+  Chapter: {chapter_title}
+  Target Section: {section_id}
+
+  [EXISTING SECTION CONTEXT (May contain OCR/extraction errors)]
+  {section_context}
+
+  [NEW UPDATE TO INTEGRATE]
+  - Concept: {update_summary}
+  - Importance: {update_why}
+
+  INSTRUCTIONS:
+  1. Ignore any fragmented sentences, merged words, or typographical errors in the Existing Section Context. Extract only the core meaning.
+  2. For "title": write a concise, descriptive subsection title.
+  3. For "paragraph_1" (Context & Extension): MUST explicitly state "Section {section_id}". Seamlessly bridge the existing textbook concepts with the new update. Explain WHAT the new development is.
+  4. For "paragraph_2" (Implications & Example): Explain WHY this matters to a student in this field. You MUST provide a brief, concrete example or theoretical application of this new concept.
+
+  STRICT CONSTRAINTS:
+  - No markdown formatting, bullet points, or bold text.
+  - Do not repeat the title in the paragraphs.
+  - Maintain an authoritative, educational tone.
+  - Each paragraph must be at least 30 words.

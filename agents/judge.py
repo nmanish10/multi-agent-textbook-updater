@@ -2,7 +2,7 @@ import re
 import logging
 
 from core.logging import get_logger, log_event
-from core.prompts import prompt_version
+from core.prompts import prompt_system, prompt_version, render_prompt
 from schemas.schemas import JudgeScore
 from utils.llm import call_mistral_structured
 
@@ -45,8 +45,6 @@ def adjust_scores(cand, scores, chapter_analysis):
     semantic_score = float(cand.get("semantic_score", 0) or 0)
     recency_score = float(cand.get("recency_score", 0.5) or 0.5)
     citation_velocity = float(cand.get("citation_velocity", 0.5) or 0.5)
-    author_signal = float(cand.get("author_signal", 0.5) or 0.5)
-    venue_score = float(cand.get("venue_score", 0.5) or 0.5)
 
     if source_type == "web":
         scores["credibility"] *= 0.95
@@ -60,11 +58,8 @@ def adjust_scores(cand, scores, chapter_analysis):
 
     scores["credibility"] = min(
         1.0,
-        0.13 * scores["credibility"]
-        + 0.57 * source_credibility
-        + 0.10 * venue_score
-        + 0.10 * author_signal
-        + 0.10 * citation_velocity,
+        0.30 * scores["credibility"]
+        + 0.70 * source_credibility,
     )
 
     overlap = compute_concept_overlap(chapter_analysis, cand)
@@ -96,60 +91,38 @@ def adjust_scores(cand, scores, chapter_analysis):
     return scores
 
 
-def judge_candidates(chapter_analysis, candidates, max_retries=2):
+def judge_candidates(
+    chapter_analysis,
+    candidates,
+    max_retries=2,
+    min_accept_score=0.78,
+    min_relevance=0.75,
+    min_credibility=0.70,
+    min_significance=0.65,
+):
     judged = []
+    prompt_name = "judge_candidate"
 
     for cand in candidates:
-        prompt = f"""
-You are a STRICT academic reviewer.
-
-Chapter Summary:
-{chapter_analysis.get("summary")}
-
-Key Concepts:
-{chapter_analysis.get("key_concepts")}
-
-Candidate:
-Title: {cand.get("candidate_title")}
-Summary: {cand.get("summary")}
-Why it matters: {cand.get("why_it_matters")}
-Source: {cand.get("source_type")}
-Date: {cand.get("date")}
-
-Score STRICTLY (0-1):
-
-- relevance
-- significance
-- credibility
-- novelty
-- pedagogical_fit
-
-Rules:
-- Penalize domain-specific or unrelated work
-- Reward core algorithmic or theoretical contributions
-- Prefer generalizable ideas
-
-Return JSON ONLY:
-{{
-  "relevance": 0.0,
-  "significance": 0.0,
-  "credibility": 0.0,
-  "novelty": 0.0,
-  "pedagogical_fit": 0.0,
-  "final_score": 0.0,
-  "decision": "accept" or "reject",
-  "reason": "short explanation"
-}}
-"""
+        prompt = render_prompt(
+            prompt_name,
+            chapter_summary=chapter_analysis.get("summary"),
+            key_concepts=chapter_analysis.get("key_concepts"),
+            candidate_title=cand.get("candidate_title"),
+            candidate_summary=cand.get("summary"),
+            candidate_why=cand.get("why_it_matters"),
+            source_type=cand.get("source_type"),
+            source_date=cand.get("date"),
+        )
 
         try:
             parsed_result = call_mistral_structured(
                 prompt,
                 JudgeScore,
-                system_prompt="You are a STRICT academic reviewer evaluating new additions for a textbook.",
+                system_prompt=prompt_system(prompt_name),
                 max_retries=max_retries,
-                prompt_name="judge_candidate",
-                prompt_version=prompt_version("judge_candidate"),
+                prompt_name=prompt_name,
+                prompt_version=prompt_version(prompt_name),
             )
             scores = parsed_result.model_dump()
             scores = adjust_scores(cand, scores, chapter_analysis)
@@ -160,15 +133,13 @@ Return JSON ONLY:
         except Exception as e:
             log_event(logger, logging.WARNING, "Judge failed for candidate", error=str(e), candidate_title=cand.get("candidate_title", ""))
 
-    filtered = [
-        cand
-        for cand in judged
-        if cand["scores"].get("decision") == "accept"
-        and cand["scores"].get("final_score", 0) >= 0.78
-        and cand["scores"].get("relevance", 0) >= 0.75
-        and cand["scores"].get("credibility", 0) >= 0.70
-        and cand["scores"].get("significance", 0) >= 0.65
-    ]
+    filtered = filter_judged_candidates(
+        judged,
+        min_accept_score=min_accept_score,
+        min_relevance=min_relevance,
+        min_credibility=min_credibility,
+        min_significance=min_significance,
+    )
 
     log_event(
         logger,
@@ -178,3 +149,22 @@ Return JSON ONLY:
         accepted_candidates=len(filtered),
     )
     return filtered
+
+
+def filter_judged_candidates(
+    judged,
+    *,
+    min_accept_score=0.78,
+    min_relevance=0.75,
+    min_credibility=0.70,
+    min_significance=0.65,
+):
+    return [
+        cand
+        for cand in judged
+        if cand["scores"].get("decision") == "accept"
+        and cand["scores"].get("final_score", 0) >= min_accept_score
+        and cand["scores"].get("relevance", 0) >= min_relevance
+        and cand["scores"].get("credibility", 0) >= min_credibility
+        and cand["scores"].get("significance", 0) >= min_significance
+    ]

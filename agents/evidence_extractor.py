@@ -2,7 +2,7 @@ import logging
 import re
 
 from core.logging import get_logger, log_event
-from core.prompts import prompt_version
+from core.prompts import prompt_system, prompt_version, render_prompt
 from schemas.schemas import ExtractedEvidence
 from utils.llm import call_mistral_structured
 
@@ -62,39 +62,24 @@ def extract_evidence(chapter_analysis, retrieval_results, max_retries=2):
     candidates = []
     concepts = chapter_analysis.get("key_concepts", [])
     retrieval_results = sorted(retrieval_results, key=source_signal_score, reverse=True)
+    prompt_name = "evidence_extraction"
 
     for result in retrieval_results:
-        prompt = f"""
-Convert this research into a textbook update.
-
-Chapter Concepts:
-{concepts}
-
-Source Title:
-{result.get("title")}
-
-Source Summary:
-{result.get("summary")}
-
-Tasks:
-1. Identify the NEW contribution (not generic)
-2. Explain clearly in 2-3 lines
-3. Explain why it matters for students
-
-IMPORTANT:
-- Focus on methods, models, or theory
-- Avoid generic descriptions
-- Be specific
-"""
+        prompt = render_prompt(
+            prompt_name,
+            chapter_concepts=concepts,
+            source_title=result.get("title"),
+            source_summary=result.get("summary"),
+        )
 
         try:
             parsed_result = call_mistral_structured(
                 prompt,
                 ExtractedEvidence,
-                system_prompt="You are an expert academic analyst extracting textbook-worthy research contributions.",
+                system_prompt=prompt_system(prompt_name),
                 max_retries=max_retries,
-                prompt_name="evidence_extraction",
-                prompt_version=prompt_version("evidence_extraction"),
+                prompt_name=prompt_name,
+                prompt_version=prompt_version(prompt_name),
             )
             parsed = parsed_result.model_dump()
 

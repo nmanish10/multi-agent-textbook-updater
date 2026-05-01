@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 import logging
+import os
 import re
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -13,6 +14,9 @@ from core.logging import get_logger, log_event
 logger = get_logger("textbook_updater.retrieval")
 embedding_model = None
 embedding_model_failed = False
+semantic_scholar_semaphore = asyncio.Semaphore(3)
+SEMANTIC_SCHOLAR_API_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
+SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "").strip()
 
 
 TRUSTED_WEB_DOMAINS = {
@@ -205,6 +209,9 @@ def infer_venue_score(venue, source_type):
 
 
 def infer_author_signal(item):
+    explicit_h_index = float(item.get("author_h_index", 0) or 0)
+    if explicit_h_index > 0:
+        return round(min(explicit_h_index / 50.0, 1.0), 4)
     works_count = float(item.get("author_works_count", 0) or 0)
     cited_by = float(item.get("author_cited_by_count", 0) or 0)
     if works_count <= 0 or cited_by <= 0:
@@ -267,6 +274,7 @@ def normalize_result(item):
         "cited_by_count": item.get("cited_by_count"),
         "author_works_count": item.get("author_works_count"),
         "author_cited_by_count": item.get("author_cited_by_count"),
+        "author_h_index": item.get("author_h_index"),
     }
     normalized.update(compute_credibility(normalized))
     return normalized
@@ -439,6 +447,56 @@ async def search_web(query, session: aiohttp.ClientSession):
         return []
 
 
+async def search_semantic_scholar(query, session: aiohttp.ClientSession):
+    headers = {}
+    if SEMANTIC_SCHOLAR_API_KEY:
+        headers["x-api-key"] = SEMANTIC_SCHOLAR_API_KEY
+
+    params = {
+        "query": query,
+        "limit": 4,
+        "fields": "title,abstract,year,url,citationCount,tldr,venue,authors.hIndex,authors.paperCount,authors.citationCount",
+    }
+    try:
+        async with semantic_scholar_semaphore:
+            async with session.get(SEMANTIC_SCHOLAR_API_URL, params=params, headers=headers, timeout=20) as res:
+                if res.status != 200:
+                    return []
+
+                payload = await res.json()
+                results = []
+                for item in payload.get("data", []):
+                    abstract = (item.get("abstract") or "").strip()
+                    tldr = ((item.get("tldr") or {}).get("text") or "").strip()
+                    summary = abstract or tldr
+                    authors = item.get("authors") or []
+                    max_h_index = max((float(author.get("hIndex", 0) or 0) for author in authors), default=0.0)
+                    total_papers = sum(float(author.get("paperCount", 0) or 0) for author in authors[:3])
+                    total_citations = sum(float(author.get("citationCount", 0) or 0) for author in authors[:3])
+
+                    result = normalize_result(
+                        {
+                            "title": item.get("title"),
+                            "summary": summary,
+                            "source": "Semantic Scholar",
+                            "source_name": "Semantic Scholar",
+                            "source_type": "paper",
+                            "date": item.get("year"),
+                            "url": item.get("url"),
+                            "venue": item.get("venue", ""),
+                            "cited_by_count": item.get("citationCount"),
+                            "author_h_index": max_h_index,
+                            "author_works_count": total_papers,
+                            "author_cited_by_count": total_citations,
+                        }
+                    )
+                    if is_valid_result(result):
+                        results.append(result)
+                return results
+    except Exception:
+        return []
+
+
 async def search_official_sources(query, session: aiohttp.ClientSession):
     headers = {"User-Agent": "Mozilla/5.0"}
     results = []
@@ -475,16 +533,24 @@ async def search_official_sources(query, session: aiohttp.ClientSession):
     return results
 
 
-async def retrieve_all_async(query):
+async def retrieve_all_async(query, enabled_sources=None):
+    configured_sources = ["openalex", "arxiv", "web", "official"] if enabled_sources is None else enabled_sources
+    enabled = {item.lower() for item in configured_sources}
     queries = generate_queries(query)
     all_results = []
     async with aiohttp.ClientSession() as session:
         tasks = []
         for refined_query in queries:
-            tasks.append(search_openalex(refined_query, session))
-            tasks.append(search_arxiv(refined_query, session))
-            tasks.append(search_web(refined_query, session))
-            tasks.append(search_official_sources(refined_query, session))
+            if "openalex" in enabled:
+                tasks.append(search_openalex(refined_query, session))
+            if "arxiv" in enabled:
+                tasks.append(search_arxiv(refined_query, session))
+            if "web" in enabled:
+                tasks.append(search_web(refined_query, session))
+            if "official" in enabled:
+                tasks.append(search_official_sources(refined_query, session))
+            if "semantic_scholar" in enabled:
+                tasks.append(search_semantic_scholar(refined_query, session))
 
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
         for item in gathered:
@@ -493,9 +559,10 @@ async def retrieve_all_async(query):
     return all_results
 
 
-def retrieve_all(query):
-    log_event(logger, logging.INFO, "Starting retrieval", query=query)
-    all_results = asyncio.run(retrieve_all_async(query))
+def retrieve_all(query, enabled_sources=None):
+    configured_sources = ["openalex", "arxiv", "web", "official"] if enabled_sources is None else enabled_sources
+    log_event(logger, logging.INFO, "Starting retrieval", query=query, enabled_sources=configured_sources)
+    all_results = asyncio.run(retrieve_all_async(query, enabled_sources=enabled_sources))
     all_results = deduplicate_results(all_results)
     if not all_results:
         log_event(logger, logging.INFO, "No retrieval results after deduplication", query=query)

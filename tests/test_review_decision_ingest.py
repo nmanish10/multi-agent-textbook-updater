@@ -100,6 +100,10 @@ class ReviewDecisionIngestTests(unittest.TestCase):
             self.assertNotIn("Rejected Update", approved_markdown)
             self.assertIn('"approved_count": 1', summary)
             self.assertIn('"rejected_count": 1', summary)
+            self.assertTrue(Path(outputs["approved_book_docx"]).exists())
+            self.assertTrue(Path(outputs["approved_book_docx_manifest"]).exists())
+            self.assertIn("approved_book_pdf_success", outputs)
+            self.assertTrue(Path(outputs["approved_book_pdf_manifest"]).exists())
 
 
 if __name__ == "__main__":

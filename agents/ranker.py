@@ -62,11 +62,11 @@ def _candidate_sort_key(candidate):
     )
 
 
-def rank_and_select(candidates, top_k=3):
+def rank_and_select(candidates, top_k=3, min_score=0.75):
     if not candidates:
         return []
 
-    candidates = [candidate for candidate in candidates if is_high_quality(candidate)]
+    candidates = [candidate for candidate in candidates if is_high_quality(candidate, min_score=min_score)]
     if not candidates:
         log_event(logger, logging.INFO, "No high-quality candidates after filtering")
         return []
@@ -93,12 +93,12 @@ def rank_and_select(candidates, top_k=3):
     return selected
 
 
-def competitive_replacement(existing_updates, new_updates, threshold=5):
+def competitive_replacement(existing_updates, new_updates, threshold=5, min_score=0.75):
     combined = list(existing_updates) + list(new_updates)
     if not combined:
         return [], []
 
-    survivors = rank_and_select(combined, top_k=threshold)
+    survivors = rank_and_select(combined, top_k=threshold, min_score=min_score)
     survivor_keys = {
         (
             item.get("candidate_title", ""),

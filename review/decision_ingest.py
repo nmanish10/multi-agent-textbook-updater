@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 from core.models import Book, WrittenUpdate
+from rendering.docx_exporter import export_docx
 from rendering.markdown_renderer import write_markdown
+from rendering.pdf_exporter import export_pdf
 
 
 DecisionMap = Dict[Tuple[str, str, str], dict]
@@ -80,7 +82,16 @@ def apply_review_decisions(updates: Iterable[WrittenUpdate], decisions: Decision
     }
 
 
-def write_review_decision_outputs(run_dir: str, review_queue_csv: str, output_markdown: str | None = None) -> dict:
+def write_review_decision_outputs(
+    run_dir: str,
+    review_queue_csv: str,
+    output_markdown: str | None = None,
+    output_docx: str | None = None,
+    output_pdf: str | None = None,
+    export_docx_enabled: bool = True,
+    export_pdf_enabled: bool = True,
+    pandoc_command: str = "pandoc",
+) -> dict:
     run_path = Path(run_dir)
     decisions = load_review_decisions(review_queue_csv)
     updates = load_written_updates(run_dir)
@@ -124,9 +135,27 @@ def write_review_decision_outputs(run_dir: str, review_queue_csv: str, output_ma
     markdown_target = output_markdown or str(review_dir / "approved_book.md")
     approved_book_path = write_markdown(book, approved_updates, markdown_target)
 
-    return {
+    outputs = {
         "summary": str(summary_path),
         "approved_updates": str(approved_path),
         "pending_updates": str(pending_path),
         "approved_book_markdown": str(approved_book_path),
     }
+
+    if export_docx_enabled:
+        approved_docx_target = output_docx or str(review_dir / "approved_book.docx")
+        ok, engine, manifest_path = export_docx(book, approved_updates, approved_docx_target)
+        outputs["approved_book_docx"] = str(Path(approved_docx_target))
+        outputs["approved_book_docx_manifest"] = str(manifest_path)
+        outputs["approved_book_docx_engine"] = engine
+        outputs["approved_book_docx_success"] = ok
+
+    if export_pdf_enabled:
+        approved_pdf_target = output_pdf or str(review_dir / "approved_book.pdf")
+        ok, engine, manifest_path = export_pdf(str(approved_book_path), approved_pdf_target, pandoc_command)
+        outputs["approved_book_pdf"] = str(Path(approved_pdf_target))
+        outputs["approved_book_pdf_manifest"] = str(manifest_path)
+        outputs["approved_book_pdf_engine"] = engine
+        outputs["approved_book_pdf_success"] = ok
+
+    return outputs

@@ -12,13 +12,7 @@ from core.models import Block, Book, ParseMetadata, ParseReport
 from ingestion.parsers.assets import write_binary_asset
 from pypdf import PdfReader
 from utils.md_parser import parse_markdown as legacy_parse_markdown
-from utils.pdf_to_md import convert_pdf_to_md
-
-
-def _clean_line(text: str) -> str:
-    text = text.replace("\r", "")
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+from utils.pdf_to_md import clean_line, convert_extracted_pages_to_md, convert_pdf_to_md
 
 
 def _is_valid_chapter(line: str) -> bool:
@@ -31,154 +25,20 @@ def _is_valid_chapter(line: str) -> bool:
     return True
 
 
-def _extract_sections(line: str) -> List[str]:
-    pattern = r"(\d+\.\d+\s+[A-Za-z][^0-9]{0,80})"
-    return re.findall(pattern, line)
-
-
-def _is_all_caps_heading(line: str) -> bool:
-    return len(line.split()) <= 8 and line.isupper() and len(line) > 5
-
-
-def _merge_lines(lines: List[str]) -> List[str]:
-    merged: List[str] = []
-    buffer = ""
-    for line in lines:
-        if not buffer:
-            buffer = line
-            continue
-        if buffer.endswith("-"):
-            buffer = buffer[:-1] + line
-            continue
-        if (
-            buffer.endswith(".")
-            or buffer.endswith(":")
-            or buffer.endswith("?")
-            or buffer.endswith("!")
-            or line.startswith("Chapter")
-            or re.match(r"\d+\.\d+", line)
-        ):
-            merged.append(buffer)
-            buffer = line
-        else:
-            buffer += " " + line
-    if buffer:
-        merged.append(buffer)
-    return merged
-
-
-def _deduplicate(lines: List[str]) -> List[str]:
-    seen = set()
-    result: List[str] = []
-    for line in lines:
-        key = re.sub(r"\W+", "", line.lower())
-        if len(key) < 20:
-            result.append(line)
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(line)
-    return result
-
-
-def _extract_chapter(line: str) -> str | None:
-    match = re.match(r"chapter\s+\d+[:\s].*", line, re.IGNORECASE)
-    if match and _is_valid_chapter(line):
-        return line.strip()
-    return None
-
-
 def _convert_pdf_to_md_pypdf(pdf_path: str, output_path: str) -> str:
     reader = PdfReader(pdf_path)
-    raw_lines: List[str] = []
+    pages_raw: List[List[str]] = []
 
     for page in reader.pages:
         text = page.extract_text() or ""
+        raw_lines: List[str] = []
         for line in text.split("\n"):
-            cleaned = _clean_line(line)
+            cleaned = clean_line(line)
             if cleaned:
                 raw_lines.append(cleaned)
+        pages_raw.append(raw_lines)
 
-    md_lines: List[str] = []
-    seen_chapters = set()
-    found_chapter = False
-
-    for line in raw_lines:
-        chapter = _extract_chapter(line)
-        if chapter and chapter not in seen_chapters:
-            seen_chapters.add(chapter)
-            found_chapter = True
-            md_lines.append(f"\n# {chapter}\n")
-            continue
-
-        if _is_all_caps_heading(line):
-            md_lines.append(f"\n## {line.title()}\n")
-            continue
-
-        sections = _extract_sections(line)
-        if sections:
-            for section in sections:
-                md_lines.append(f"\n## {section.strip()}\n")
-                line = line.replace(section, "").strip()
-
-        if line:
-            md_lines.append(line)
-
-    md_lines = _merge_lines(md_lines)
-    if not found_chapter:
-        fallback_lines = []
-        for line in md_lines:
-            if re.match(r"^\d+\s+[A-Za-z]", line):
-                fallback_lines.append(f"\n# {line}\n")
-            else:
-                fallback_lines.append(line)
-        md_lines = fallback_lines
-
-    md_lines = _deduplicate(md_lines)
-    Path(output_path).write_text("\n".join(md_lines), encoding="utf-8")
-    return output_path
-
-
-def _lines_to_markdown(raw_lines: List[str], output_path: str) -> str:
-    md_lines: List[str] = []
-    seen_chapters = set()
-    found_chapter = False
-
-    for line in raw_lines:
-        chapter = _extract_chapter(line)
-        if chapter and chapter not in seen_chapters:
-            seen_chapters.add(chapter)
-            found_chapter = True
-            md_lines.append(f"\n# {chapter}\n")
-            continue
-
-        if _is_all_caps_heading(line):
-            md_lines.append(f"\n## {line.title()}\n")
-            continue
-
-        sections = _extract_sections(line)
-        if sections:
-            for section in sections:
-                md_lines.append(f"\n## {section.strip()}\n")
-                line = line.replace(section, "").strip()
-
-        if line:
-            md_lines.append(line)
-
-    md_lines = _merge_lines(md_lines)
-    if not found_chapter:
-        fallback_lines = []
-        for line in md_lines:
-            if re.match(r"^\d+\s+[A-Za-z]", line):
-                fallback_lines.append(f"\n# {line}\n")
-            else:
-                fallback_lines.append(line)
-        md_lines = fallback_lines
-
-    md_lines = _deduplicate(md_lines)
-    Path(output_path).write_text("\n".join(md_lines), encoding="utf-8")
-    return output_path
+    return convert_extracted_pages_to_md(pages_raw, output_path=output_path)
 
 
 def _ocr_runtime_status() -> tuple[bool, str]:
@@ -213,15 +73,17 @@ def _convert_pdf_to_md_ocr(pdf_path: str, output_path: str) -> str:
 
     poppler_path = os.getenv("POPPLER_PATH", "").strip() or None
     images = convert_from_path(pdf_path, dpi=200, poppler_path=poppler_path)
-    raw_lines: List[str] = []
+    pages_raw: List[List[str]] = []
     for image in images:
         text = pytesseract.image_to_string(image) or ""
+        page_lines: List[str] = []
         for line in text.splitlines():
-            cleaned = _clean_line(line)
+            cleaned = clean_line(line)
             if cleaned:
-                raw_lines.append(cleaned)
+                page_lines.append(cleaned)
+        pages_raw.append(page_lines)
 
-    return _lines_to_markdown(raw_lines, output_path)
+    return convert_extracted_pages_to_md(pages_raw, output_path=output_path)
 
 
 def _score_book(book: Book) -> Tuple[float, List[str]]:

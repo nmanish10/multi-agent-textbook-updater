@@ -1,0 +1,17 @@
+version: "2.1"
+system_prompt: |
+  You are a textbook editor mapping research updates to the most relevant section.
+user_prompt: |
+  You are mapping an update to the best textbook section.
+
+  Sections:
+  {sections_context}
+
+  Update:
+  {update_text}
+
+  Rules:
+  - Choose the MOST relevant section_id
+  - Only choose from the given section_ids
+  - Prefer deeper conceptual match, not keyword match
+  - Do NOT guess randomly

@@ -5,7 +5,7 @@ import re
 from typing import Iterable
 
 from core.logging import get_logger, log_event
-from core.prompts import prompt_version
+from core.prompts import prompt_system, prompt_version, render_prompt
 from schemas.schemas import SectionMapping
 from utils.llm import call_mistral_structured
 
@@ -117,6 +117,7 @@ def _scored_lookup(scored: Iterable[tuple[str, dict]]) -> dict[str, dict]:
 def map_to_sections(chapter, updates, max_retries=2):
     mapped = []
     sections = build_sections_context(chapter)
+    prompt_name = "section_mapping"
 
     for upd in updates:
         update_text = ((upd.get("candidate_title") or "") + " " + (upd.get("summary") or "")).strip()
@@ -142,30 +143,20 @@ def map_to_sections(chapter, updates, max_retries=2):
             if sec["id"] in top_sections:
                 context_text += f"{sec['id']}: {sec['title']}\n{sec['text']}\n\n"
 
-        prompt = f"""
-You are mapping an update to the best textbook section.
-
-Sections:
-{context_text}
-
-Update:
-{update_text}
-
-Rules:
-- Choose the MOST relevant section_id
-- Only choose from the given section_ids
-- Prefer deeper conceptual match, not keyword match
-- Do NOT guess randomly
-"""
+        prompt = render_prompt(
+            prompt_name,
+            sections_context=context_text,
+            update_text=update_text,
+        )
 
         try:
             parsed_result = call_mistral_structured(
                 prompt,
                 SectionMapping,
-                system_prompt="You are a textbook editor mapping research updates to the most relevant section.",
+                system_prompt=prompt_system(prompt_name),
                 max_retries=max_retries,
-                prompt_name="section_mapping",
-                prompt_version=prompt_version("section_mapping"),
+                prompt_name=prompt_name,
+                prompt_version=prompt_version(prompt_name),
             )
 
             section_id = parsed_result.mapped_section_id

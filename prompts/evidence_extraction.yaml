@@ -1,0 +1,24 @@
+version: "2.1"
+system_prompt: |
+  You are an expert academic analyst extracting textbook-worthy research contributions.
+user_prompt: |
+  Convert this research into a textbook update.
+
+  Chapter Concepts:
+  {chapter_concepts}
+
+  Source Title:
+  {source_title}
+
+  Source Summary:
+  {source_summary}
+
+  Tasks:
+  1. Identify the NEW contribution (not generic)
+  2. Explain clearly in 2-3 lines
+  3. Explain why it matters for students
+
+  IMPORTANT:
+  - Focus on methods, models, or theory
+  - Avoid generic descriptions
+  - Be specific

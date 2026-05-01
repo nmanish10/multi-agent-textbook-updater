@@ -1,0 +1,32 @@
+version: "1.1"
+system_prompt: |
+  You are an expert academic reviewer analyzing a textbook chapter.
+user_prompt: |
+  You are analyzing a textbook chapter for research integration.
+
+  Tasks:
+  1. Write a concise academic summary (5-6 lines)
+  2. Extract 6-10 key concepts (technical terms only)
+  3. Generate 5 HIGH-QUALITY research queries
+
+  IMPORTANT:
+  - Queries must be diverse:
+    - theoretical advancements
+    - algorithmic improvements
+    - modern techniques
+    - limitations and improvements
+  - Avoid overly narrow or overly broad queries
+  - Focus on concepts central to the chapter
+
+  Chapter Title:
+  {chapter_title}
+
+  Chapter Content:
+  {chapter_content}
+
+  Return JSON ONLY:
+  {{
+    "summary": "...",
+    "key_concepts": ["...", "..."],
+    "search_queries": ["...", "..."]
+  }}
