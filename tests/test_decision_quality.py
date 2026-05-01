@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from agents.evidence_extractor import source_signal_score
 from agents.judge import adjust_scores
 from agents.retrieval import (
     canonicalize_url,
     compute_credibility,
+    evaluate_domain_authority,
     infer_credibility,
     normalize_result,
     retrieve_all_async,
@@ -20,21 +22,30 @@ class DecisionQualityTests(unittest.TestCase):
         url = "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.nist.gov%2Fai"
         self.assertEqual(canonicalize_url(url), "https://nist.gov/ai")
 
-    def test_trusted_domain_gets_high_web_credibility(self) -> None:
-        self.assertGreaterEqual(infer_credibility("web", "https://www.nist.gov/ai"), 0.95)
-        self.assertLessEqual(infer_credibility("web", "https://medium.com/some-post"), 0.3)
-        self.assertGreaterEqual(infer_credibility("official_source", "https://openai.com/index/hello"), 0.95)
+    def test_domain_authority_uses_dynamic_evaluator_and_anchors(self) -> None:
+        with patch("agents.retrieval.evaluate_domain_authority", return_value=0.97):
+            self.assertGreaterEqual(infer_credibility("web", "https://www.nist.gov/ai"), 0.95)
+        with patch("agents.retrieval.evaluate_domain_authority", return_value=0.22):
+            self.assertLessEqual(infer_credibility("web", "https://medium.com/some-post"), 0.3)
+        with patch("agents.retrieval.evaluate_domain_authority", return_value=0.96):
+            self.assertGreaterEqual(infer_credibility("official_source", "https://openai.com/index/hello"), 0.95)
+
+    def test_gov_and_edu_have_non_manual_heuristic_floors(self) -> None:
+        with patch("agents.retrieval._cached_domain_score", return_value=0.2):
+            self.assertGreaterEqual(evaluate_domain_authority("nist.gov"), 0.88)
+            self.assertGreaterEqual(evaluate_domain_authority("mit.edu"), 0.85)
 
     def test_normalize_result_adds_credibility_and_domain(self) -> None:
-        result = normalize_result(
-            {
-                "title": "NIST AI Guidance",
-                "summary": "Detailed technical guidance for robust and trustworthy AI systems.",
-                "source": "Web",
-                "source_type": "web",
-                "url": "https://www.nist.gov/ai",
-            }
-        )
+        with patch("agents.retrieval.evaluate_domain_authority", return_value=0.96):
+            result = normalize_result(
+                {
+                    "title": "NIST AI Guidance",
+                    "summary": "Detailed technical guidance for robust and trustworthy AI systems.",
+                    "source": "Web",
+                    "source_type": "web",
+                    "url": "https://www.nist.gov/ai",
+                }
+            )
         self.assertEqual(result["domain"], "nist.gov")
         self.assertGreaterEqual(result["credibility_score"], 0.95)
 
@@ -44,28 +55,30 @@ class DecisionQualityTests(unittest.TestCase):
         self.assertGreater(source_signal_score(strong), source_signal_score(weak))
 
     def test_multi_signal_credibility_rewards_recent_strong_venue(self) -> None:
-        recent = compute_credibility(
-            {
-                "source_type": "paper",
-                "url": "https://example.com/paper",
-                "date": "2026-03-01",
-                "venue": "NeurIPS 2026",
-                "cited_by_count": 18,
-                "author_works_count": 120,
-                "author_cited_by_count": 2400,
-            }
-        )
-        weak = compute_credibility(
-            {
-                "source_type": "web",
-                "url": "https://medium.com/post",
-                "date": "2024-01-01",
-                "venue": "",
-                "cited_by_count": 0,
-                "author_works_count": 0,
-                "author_cited_by_count": 0,
-            }
-        )
+        with patch("agents.retrieval.evaluate_domain_authority", side_effect=[0.6, 0.25]):
+            recent = compute_credibility(
+                {
+                    "source_type": "paper",
+                    "url": "https://example.com/paper",
+                    "date": "2026-03-01",
+                    "venue": "Any Venue",
+                    "cited_by_count": 140,
+                    "influential_citation_count": 24,
+                    "author_works_count": 120,
+                    "author_cited_by_count": 2400,
+                }
+            )
+            weak = compute_credibility(
+                {
+                    "source_type": "web",
+                    "url": "https://medium.com/post",
+                    "date": "2024-01-01",
+                    "venue": "",
+                    "cited_by_count": 0,
+                    "author_works_count": 0,
+                    "author_cited_by_count": 0,
+                }
+            )
         self.assertGreater(recent["credibility_score"], weak["credibility_score"])
         self.assertGreaterEqual(recent["venue_score"], 0.9)
 
@@ -120,16 +133,18 @@ class DecisionQualityTests(unittest.TestCase):
         self.assertAlmostEqual(adjusted["credibility"], 0.30 * 0.432 + 0.70 * 0.9, delta=0.03)
 
     def test_explicit_author_h_index_strengthens_credibility(self) -> None:
-        enriched = compute_credibility(
-            {
-                "source_type": "paper",
-                "url": "https://example.com/semantic-scholar-paper",
-                "date": "2026-02-01",
-                "venue": "ICLR 2026",
-                "cited_by_count": 10,
-                "author_h_index": 42,
-            }
-        )
+        with patch("agents.retrieval.evaluate_domain_authority", return_value=0.6):
+            enriched = compute_credibility(
+                {
+                    "source_type": "paper",
+                    "url": "https://example.com/semantic-scholar-paper",
+                    "date": "2026-02-01",
+                    "venue": "Any Venue",
+                    "cited_by_count": 120,
+                    "influential_citation_count": 20,
+                    "author_h_index": 42,
+                }
+            )
         self.assertGreaterEqual(enriched["author_signal"], 0.8)
         self.assertGreaterEqual(enriched["credibility_score"], 0.8)
 

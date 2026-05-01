@@ -42,3 +42,9 @@ class WriterOutput(BaseModel):
     title: str
     paragraph_1: str
     paragraph_2: str
+
+
+class DomainEvaluation(BaseModel):
+    """LLM-generated evaluation of a web domain's credibility."""
+    credibility_score: float
+    reason: str

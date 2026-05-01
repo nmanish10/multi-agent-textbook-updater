@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
+import { toast } from "@/components/toast";
 import { API_BASE_URL, type PipelineJobResponse } from "@/lib/api";
 
 type PipelineMonitorProps = {
@@ -127,11 +128,9 @@ export function BookPipelineLauncher({ bookKey, inputFile }: BookPipelineLaunche
   const [jobId, setJobId] = useState("");
   const [open, setOpen] = useState(false);
   const [starting, setStarting] = useState(false);
-  const [message, setMessage] = useState("");
 
   async function startRun() {
     setStarting(true);
-    setMessage("");
     try {
       const response = await fetch(`${API_BASE_URL}/api/pipeline/run`, {
         method: "POST",
@@ -147,8 +146,9 @@ export function BookPipelineLauncher({ bookKey, inputFile }: BookPipelineLaunche
       }
       setJobId(payload.job_id);
       setOpen(true);
+      toast.info("Pipeline job started.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Failed to start the pipeline.");
+      toast.error(error instanceof Error ? error.message : "Failed to start the pipeline.");
     } finally {
       setStarting(false);
     }
@@ -164,7 +164,6 @@ export function BookPipelineLauncher({ bookKey, inputFile }: BookPipelineLaunche
       <button className="actionButton sidebarActionButton" onClick={startRun} disabled={starting}>
         {starting ? "Starting..." : "Run AI Update"}
       </button>
-      {message ? <p className="statusMessage warningMessage">{message}</p> : null}
       {open ? (
         <PipelineJobModal
           title={bookKey}

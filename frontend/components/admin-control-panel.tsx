@@ -77,6 +77,7 @@ export function AdminControlPanel({
       } else if (payload.job_id) {
         setActiveJobId(payload.job_id);
         setActiveJobTitle(runIfDue ? "Scheduled pipeline run" : "Manual pipeline run");
+        toast.info("Pipeline job started.");
       } else {
         toast.success(`Pipeline run completed${payload.summary?.run_id ? `: ${payload.summary.run_id}` : "."}`);
       }
@@ -277,7 +278,6 @@ export function AdminControlPanel({
         </article>
       </div>
 
-      {message ? <p className="statusMessage">{message}</p> : null}
       {activeJobId ? (
         <PipelineJobModal
           title={activeJobTitle}

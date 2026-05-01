@@ -1,8 +1,12 @@
 import asyncio
 from datetime import datetime, timezone
+import json
 import logging
 import os
 import re
+import sqlite3
+import threading
+from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
@@ -17,60 +21,14 @@ embedding_model_failed = False
 semantic_scholar_semaphore = asyncio.Semaphore(3)
 SEMANTIC_SCHOLAR_API_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "").strip()
-
-
-TRUSTED_WEB_DOMAINS = {
-    "nature.com": 0.93,
-    "science.org": 0.93,
-    "springer.com": 0.9,
-    "ieee.org": 0.95,
-    "acm.org": 0.95,
-    "nih.gov": 0.96,
-    "nist.gov": 0.98,
-    "who.int": 0.98,
-    "oecd.org": 0.96,
-    "arxiv.org": 0.72,
-    "wikipedia.org": 0.55,
-}
-
-OFFICIAL_SOURCE_REGISTRY = {
-    "openai": {"label": "OpenAI", "domain": "openai.com", "query_prefix": "site:openai.com", "credibility": 0.98},
-    "google_deepmind": {
-        "label": "Google DeepMind",
-        "domain": "deepmind.google",
-        "query_prefix": "site:deepmind.google",
-        "credibility": 0.98,
-    },
-    "meta_ai": {"label": "Meta AI", "domain": "ai.meta.com", "query_prefix": "site:ai.meta.com", "credibility": 0.96},
-    "nist": {"label": "NIST", "domain": "nist.gov", "query_prefix": "site:nist.gov", "credibility": 0.98},
-    "ieee": {"label": "IEEE", "domain": "ieee.org", "query_prefix": "site:ieee.org", "credibility": 0.96},
-}
-
-VENUE_TIERS = {
-    "neurips": 0.95,
-    "icml": 0.95,
-    "iclr": 0.95,
-    "nature": 0.95,
-    "science": 0.95,
-    "aaai": 0.88,
-    "emnlp": 0.88,
-    "cvpr": 0.88,
-    "acl": 0.88,
-    "ieee": 0.82,
-    "acm": 0.82,
-    "arxiv": 0.55,
-}
-
-LOW_SIGNAL_DOMAINS = {
-    "medium.com",
-    "towardsdatascience.com",
-    "linkedin.com",
-    "youtube.com",
-    "facebook.com",
-    "instagram.com",
-    "x.com",
-    "twitter.com",
-}
+DOMAIN_CACHE_PATH = Path(
+    os.getenv(
+        "DOMAIN_CACHE_PATH",
+        str(Path(__file__).resolve().parents[1] / "storage" / "domain_cache.db"),
+    )
+)
+DOMAIN_CACHE_LOCK = threading.Lock()
+DOMAIN_CACHE_READY = False
 
 
 def get_embedding_model():
@@ -136,28 +94,138 @@ def extract_domain(url):
     return netloc
 
 
-def infer_credibility(source_type, url):
-    if source_type == "official_source":
-        domain = extract_domain(url)
-        for entry in OFFICIAL_SOURCE_REGISTRY.values():
-            if domain.endswith(entry["domain"]):
-                return entry["credibility"]
-        return 0.95
-    if source_type == "paper":
-        return 0.95
-    if source_type == "preprint":
-        return 0.78
+def _ensure_domain_cache() -> None:
+    global DOMAIN_CACHE_READY
+    if DOMAIN_CACHE_READY:
+        return
+    DOMAIN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with DOMAIN_CACHE_LOCK:
+        if DOMAIN_CACHE_READY:
+            return
+        with sqlite3.connect(DOMAIN_CACHE_PATH) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS domain_scores (
+                    domain TEXT PRIMARY KEY,
+                    score REAL NOT NULL,
+                    rationale TEXT NOT NULL DEFAULT '',
+                    evaluator TEXT NOT NULL DEFAULT 'llm',
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+        DOMAIN_CACHE_READY = True
 
-    domain = extract_domain(url)
-    if domain in TRUSTED_WEB_DOMAINS:
-        return TRUSTED_WEB_DOMAINS[domain]
-    if domain in LOW_SIGNAL_DOMAINS:
-        return 0.28
-    if domain.endswith(".edu") or domain.endswith(".gov"):
+
+def _cached_domain_score(domain: str) -> float | None:
+    if not domain:
+        return None
+    _ensure_domain_cache()
+    with DOMAIN_CACHE_LOCK:
+        with sqlite3.connect(DOMAIN_CACHE_PATH) as conn:
+            row = conn.execute("SELECT score FROM domain_scores WHERE domain = ?", (domain,)).fetchone()
+    return float(row[0]) if row else None
+
+
+def _store_domain_score(domain: str, score: float, rationale: str, evaluator: str = "llm") -> None:
+    if not domain:
+        return
+    _ensure_domain_cache()
+    bounded_score = max(0.0, min(float(score), 1.0))
+    with DOMAIN_CACHE_LOCK:
+        with sqlite3.connect(DOMAIN_CACHE_PATH) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO domain_scores(domain, score, rationale, evaluator, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (domain, bounded_score, rationale[:1000], evaluator, datetime.now(timezone.utc).isoformat()),
+            )
+
+
+def _parse_domain_score(response_text: str) -> tuple[float, str]:
+    cleaned = (response_text or "").strip()
+    try:
+        payload = json.loads(cleaned)
+        score = float(payload.get("score", payload.get("credibility_score", 0.45)))
+        rationale = str(payload.get("rationale", "")).strip()
+        return max(0.0, min(score, 1.0)), rationale
+    except Exception:
+        match = re.search(r"(?:0(?:\.\d+)?|1(?:\.0+)?)", cleaned)
+        if match:
+            return float(match.group(0)), cleaned[:500]
+    return 0.45, "Unable to parse evaluator response; using neutral fallback."
+
+
+def _heuristic_domain_floor(domain: str) -> float:
+    if not domain:
+        return 0.45
+    if domain.endswith(".gov"):
         return 0.88
-    if domain.endswith(".org"):
-        return 0.72
-    return 0.45
+    if domain.endswith(".edu"):
+        return 0.85
+    return 0.0
+
+
+def evaluate_domain_authority(domain: str) -> float:
+    domain = (domain or "").strip().lower()
+    if not domain:
+        return 0.45
+
+    cached = _cached_domain_score(domain)
+    if cached is not None:
+        return max(cached, _heuristic_domain_floor(domain))
+
+    prompt = (
+        "Evaluate the academic and technical credibility of this web domain for use as a source "
+        "in an autonomous textbook update system.\n\n"
+        f"Domain: {domain}\n\n"
+        "Return raw JSON only with this shape: "
+        "{\"score\": 0.0, \"rationale\": \"brief reason\"}. "
+        "Score 0.95-1.0 for official institutional/product/research domains and elite scholarly publishers; "
+        "0.75-0.9 for reputable universities, government agencies, standards bodies, or established research outlets; "
+        "0.45-0.7 for general technology journalism or mixed-quality aggregators; "
+        "0.0-0.35 for personal blogs, social media, content farms, SEO pages, or low-verifiability sources."
+    )
+    try:
+        from utils.llm import call_mistral
+
+        response = call_mistral(
+            prompt,
+            system_prompt="You are a cautious academic source-quality evaluator. Return only valid JSON.",
+            max_retries=1,
+            prompt_name="domain_authority_evaluation",
+            prompt_version="1.0",
+        )
+        score, rationale = _parse_domain_score(response)
+        score = max(score, _heuristic_domain_floor(domain))
+        _store_domain_score(domain, score, rationale)
+        log_event(logger, logging.INFO, "Cached dynamic domain authority", domain=domain, score=score)
+        return score
+    except Exception as exc:
+        fallback = max(_heuristic_domain_floor(domain), 0.45)
+        _store_domain_score(domain, fallback, f"LLM evaluator unavailable: {exc}", evaluator="fallback")
+        log_event(
+            logger,
+            logging.WARNING,
+            "Domain authority evaluator unavailable; using fallback score",
+            domain=domain,
+            score=fallback,
+            error=str(exc),
+        )
+        return fallback
+
+
+def infer_credibility(source_type, url):
+    domain = extract_domain(url)
+    score = evaluate_domain_authority(domain)
+    if source_type == "official_source":
+        return max(score, 0.90)
+    if source_type == "preprint":
+        return max(score, 0.55)
+    if source_type == "paper":
+        return max(score, 0.60)
+    return score
 
 
 def months_since(date_value):
@@ -194,18 +262,29 @@ def compute_citation_velocity(cited_by_count, date_value):
     return round(min(velocity / 20.0, 1.0), 4)
 
 
-def infer_venue_score(venue, source_type):
-    venue_text = (venue or "").lower()
-    for key, score in VENUE_TIERS.items():
-        if key in venue_text:
-            return score
+def infer_venue_score(venue, source_type, cited_by_count=0, date_value=None, influential_citation_count=0):
+    citations = float(cited_by_count or 0)
+    influential = float(influential_citation_count or 0)
+    age_months = max(months_since(date_value), 1.0)
+    annualized_citations = citations / max(age_months / 12.0, 0.25)
+    annualized_influential = influential / max(age_months / 12.0, 0.25)
+
+    citation_signal = min(annualized_citations / 75.0, 1.0)
+    influential_signal = min(annualized_influential / 18.0, 1.0)
+    if citations >= 500:
+        citation_signal = max(citation_signal, 0.90)
+    elif citations >= 100:
+        citation_signal = max(citation_signal, 0.75)
+    elif citations >= 25:
+        citation_signal = max(citation_signal, 0.58)
+
     if source_type == "official_source":
         return 0.95
     if source_type == "paper":
-        return 0.75
+        return round(max(0.55, 0.55 + 0.28 * citation_signal + 0.17 * influential_signal), 4)
     if source_type == "preprint":
-        return 0.55
-    return 0.5
+        return round(max(0.45, 0.45 + 0.22 * citation_signal + 0.13 * influential_signal), 4)
+    return round(max(0.35, 0.35 + 0.25 * citation_signal + 0.15 * influential_signal), 4)
 
 
 def infer_author_signal(item):
@@ -234,7 +313,13 @@ def source_channel_score(source_type):
 def compute_credibility(item):
     source_type = item.get("source_type", "")
     url = item.get("url", "")
-    venue_score = infer_venue_score(item.get("venue", ""), source_type)
+    venue_score = infer_venue_score(
+        item.get("venue", ""),
+        source_type,
+        item.get("cited_by_count"),
+        item.get("date"),
+        item.get("influential_citation_count"),
+    )
     author_signal = infer_author_signal(item)
     recency_score = compute_recency_score(item.get("date"))
     citation_velocity = compute_citation_velocity(item.get("cited_by_count"), item.get("date"))
@@ -272,6 +357,7 @@ def normalize_result(item):
         "domain": extract_domain(url),
         "venue": item.get("venue", ""),
         "cited_by_count": item.get("cited_by_count"),
+        "influential_citation_count": item.get("influential_citation_count"),
         "author_works_count": item.get("author_works_count"),
         "author_cited_by_count": item.get("author_cited_by_count"),
         "author_h_index": item.get("author_h_index"),
@@ -283,8 +369,7 @@ def normalize_result(item):
 def is_valid_result(item):
     if not (item["title"] and len(item["title"]) > 5 and item["summary"] and len(item["summary"]) > 30):
         return False
-    domain = item.get("domain", "")
-    if domain in LOW_SIGNAL_DOMAINS:
+    if item.get("credibility_score", 0.45) < 0.25:
         return False
     if len(item["summary"].split()) < 8:
         return False
@@ -455,7 +540,7 @@ async def search_semantic_scholar(query, session: aiohttp.ClientSession):
     params = {
         "query": query,
         "limit": 4,
-        "fields": "title,abstract,year,url,citationCount,tldr,venue,authors.hIndex,authors.paperCount,authors.citationCount",
+        "fields": "title,abstract,year,url,citationCount,influentialCitationCount,tldr,venue,authors.hIndex,authors.paperCount,authors.citationCount",
     }
     try:
         async with semantic_scholar_semaphore:
@@ -485,6 +570,7 @@ async def search_semantic_scholar(query, session: aiohttp.ClientSession):
                             "url": item.get("url"),
                             "venue": item.get("venue", ""),
                             "cited_by_count": item.get("citationCount"),
+                            "influential_citation_count": item.get("influentialCitationCount"),
                             "author_h_index": max_h_index,
                             "author_works_count": total_papers,
                             "author_cited_by_count": total_citations,
@@ -500,36 +586,34 @@ async def search_semantic_scholar(query, session: aiohttp.ClientSession):
 async def search_official_sources(query, session: aiohttp.ClientSession):
     headers = {"User-Agent": "Mozilla/5.0"}
     results = []
-    for source in OFFICIAL_SOURCE_REGISTRY.values():
-        scoped_query = f"{source['query_prefix']} {query}"
-        try:
-            async with session.post(
-                "https://html.duckduckgo.com/html/",
-                headers=headers,
-                data={"q": scoped_query},
-                timeout=10,
-            ) as res:
-                text_data = await res.text()
-                soup = BeautifulSoup(text_data, "html.parser")
-                for item in soup.select(".result")[:2]:
-                    title = item.select_one(".result__title")
-                    snippet = item.select_one(".result__snippet")
-                    link = item.select_one("a.result__a")
-                    result = normalize_result(
-                        {
-                            "title": title.get_text(strip=True) if title else "",
-                            "summary": snippet.get_text(strip=True) if snippet else "",
-                            "source": source["label"],
-                            "source_name": source["label"],
-                            "source_type": "official_source",
-                            "url": link["href"] if link else "",
-                            "venue": source["label"],
-                        }
-                    )
-                    if result["domain"].endswith(source["domain"]) and is_valid_result(result):
-                        results.append(result)
-        except Exception:
-            continue
+    scoped_query = f"{query} official source research announcement documentation"
+    try:
+        async with session.post(
+            "https://html.duckduckgo.com/html/",
+            headers=headers,
+            data={"q": scoped_query},
+            timeout=10,
+        ) as res:
+            text_data = await res.text()
+            soup = BeautifulSoup(text_data, "html.parser")
+            for item in soup.select(".result")[:5]:
+                title = item.select_one(".result__title")
+                snippet = item.select_one(".result__snippet")
+                link = item.select_one("a.result__a")
+                result = normalize_result(
+                    {
+                        "title": title.get_text(strip=True) if title else "",
+                        "summary": snippet.get_text(strip=True) if snippet else "",
+                        "source": "Official candidate",
+                        "source_name": extract_domain(link["href"]) if link else "Official candidate",
+                        "source_type": "official_source",
+                        "url": link["href"] if link else "",
+                    }
+                )
+                if result["credibility_score"] >= 0.90 and is_valid_result(result):
+                    results.append(result)
+    except Exception:
+        return []
     return results
 
 
