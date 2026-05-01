@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Inter, Outfit } from "next/font/google";
+import { Toaster } from "@/components/toast";
 
 import "./globals.css";
 
@@ -44,6 +45,7 @@ export default function RootLayout({
           </header>
           <main>{children}</main>
         </div>
+        <Toaster />
       </body>
     </html>
   );

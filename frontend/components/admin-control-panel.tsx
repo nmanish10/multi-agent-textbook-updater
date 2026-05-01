@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { toast } from "@/components/toast";
 
 import { PipelineJobModal } from "@/components/pipeline-monitor";
 import { API_BASE_URL, type AdminConfigResponse, type ScheduleResponse } from "@/lib/api";
@@ -33,11 +34,9 @@ export function AdminControlPanel({
   const [running, setRunning] = useState(false);
   const [activeJobId, setActiveJobId] = useState("");
   const [activeJobTitle, setActiveJobTitle] = useState("");
-  const [message, setMessage] = useState<string>("");
 
   async function saveConfig() {
     setSaving(true);
-    setMessage("");
     try {
       const response = await fetch(`${API_BASE_URL}/api/admin/config`, {
         method: "PUT",
@@ -49,9 +48,9 @@ export function AdminControlPanel({
       }
       const payload = (await response.json()) as AdminConfigResponse;
       setConfig(payload);
-      setMessage("Admin configuration saved.");
+      toast.success("Admin configuration saved.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Failed to save config.");
+      toast.error(error instanceof Error ? error.message : "Failed to save config.");
     } finally {
       setSaving(false);
     }
@@ -59,7 +58,6 @@ export function AdminControlPanel({
 
   async function triggerRun(runIfDue: boolean) {
     setRunning(true);
-    setMessage("");
     try {
       const response = await fetch(`${API_BASE_URL}/api/pipeline/run`, {
         method: "POST",
@@ -71,7 +69,7 @@ export function AdminControlPanel({
       }
       const payload = (await response.json()) as RunResponse;
       if (payload.status === "not_due") {
-        setMessage(
+        toast.info(
           payload.scheduler?.next_run_utc
             ? `No run started. Next due: ${new Date(payload.scheduler.next_run_utc).toLocaleString()}`
             : "No run started because the schedule is not due."
@@ -79,12 +77,11 @@ export function AdminControlPanel({
       } else if (payload.job_id) {
         setActiveJobId(payload.job_id);
         setActiveJobTitle(runIfDue ? "Scheduled pipeline run" : "Manual pipeline run");
-        setMessage("");
       } else {
-        setMessage(`Pipeline run completed${payload.summary?.run_id ? `: ${payload.summary.run_id}` : "."}`);
+        toast.success(`Pipeline run completed${payload.summary?.run_id ? `: ${payload.summary.run_id}` : "."}`);
       }
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Failed to trigger run.");
+      toast.error(error instanceof Error ? error.message : "Failed to trigger run.");
     } finally {
       setRunning(false);
     }

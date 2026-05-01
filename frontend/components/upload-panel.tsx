@@ -1,21 +1,20 @@
 "use client";
 
 import { useState } from "react";
+import { toast } from "@/components/toast";
 
 import { API_BASE_URL } from "@/lib/api";
 
 export function UploadPanel() {
   const [file, setFile] = useState<File | null>(null);
-  const [status, setStatus] = useState<string>("");
   const [uploading, setUploading] = useState(false);
 
   async function upload() {
     if (!file) {
-      setStatus("Choose a textbook file first.");
+      toast.info("Choose a textbook file first.");
       return;
     }
     setUploading(true);
-    setStatus("");
     try {
       const formData = new FormData();
       formData.append("file", file);
@@ -27,10 +26,10 @@ export function UploadPanel() {
       if (!response.ok) {
         throw new Error(payload.detail || `Upload failed: ${response.status}`);
       }
-      setStatus(`Uploaded to ${payload.stored_path}`);
+      toast.success(`Uploaded to ${payload.stored_path}`);
       setFile(null);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Upload failed.");
+      toast.error(error instanceof Error ? error.message : "Upload failed.");
     } finally {
       setUploading(false);
     }
@@ -56,7 +55,6 @@ export function UploadPanel() {
           {uploading ? "Uploading..." : "Upload Book"}
         </button>
       </div>
-      {status ? <p className="statusMessage">{status}</p> : null}
     </section>
   );
 }
