@@ -70,13 +70,14 @@ Each chapter is analyzed with `agents/chapter_analysis.py` to produce:
 - reasoning summary
 
 ### 5. Retrieval
-`agents/retrieval.py` fetches evidence from academic and web sources, including an official-source lane for standards, benchmark owners, and major AI labs.
+`agents/retrieval.py` fetches evidence from academic and web sources.
 
-Retrieval now combines:
+Retrieval now features a **Fully Autonomous Credibility Engine** that combines:
 - source normalization and URL canonicalization
-- official-source discovery for sources such as OpenAI, Google DeepMind, Meta AI, NIST, and IEEE
-- optional Semantic Scholar enrichment for author h-index style metadata and citation velocity support
-- a multi-signal credibility model using venue quality, author signal, recency, citation velocity, and source channel
+- parallel fetching from arXiv, OpenAlex, Semantic Scholar, DuckDuckGo (web), and an official-source lane
+- **Zero-touch LLM Domain Authority Evaluator:** Instead of hardcoded domain registries, an LLM evaluates the academic and technical credibility of any new web domain on the fly (0.0 to 1.0).
+- **Persistent Domain Cache:** LLM domain evaluations and rationales are cached in a local SQLite database (`storage/domain_cache.db`) for high performance.
+- **Dynamic Semantic Scholar Scoring:** Paper tiers and impact are dynamically calculated using live `cited_by_count` and `influential_citation_count` metrics, eliminating hardcoded venue lists.
 - lexical and embedding-aware reranking with graceful fallback when the embedding model is unavailable
 
 ### 6. Evidence extraction
